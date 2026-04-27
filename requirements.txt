@@ -3,3 +3,5 @@ pandas
 lightgbm
 numpy
 scikit-learn
+soccerdata
+pyarrow

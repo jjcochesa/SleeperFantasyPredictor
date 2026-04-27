@@ -2,27 +2,29 @@
 Sleeper Fantasy Premier League Weekly Predictor
 ================================================
 
-Run this script every week to:
-1. Pull live FPL API data (current season history)
-2. Train LightGBM component models per position
-3. Predict expected Sleeper points for next gameweek
-4. Interactive CLI to explore, filter, and pick best players
+Data sources
+  • FPL API  – goals, assists, clean sheets, saves, cards, goals conceded,
+               minutes, xG, xA, ICT index, player availability
+  • FBref    – shots on target, key passes, accurate crosses, tackles won,
+               interceptions, blocked shots, clearances, dribbles, aerials
+
+These are the same Opta stats Sleeper uses for scoring.
 
 Usage:
     python sleeper_predictor.py
 
 Requirements:
-    pip install requests pandas lightgbm numpy scikit-learn
+    pip install requests pandas lightgbm numpy scikit-learn soccerdata pyarrow
 
-Author: Sleeper Predictor for Juan (GW34 onwards)
+Author: Sleeper Predictor for Juan
 """
 
+import difflib
 import json
 import logging
 import warnings
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -39,31 +41,107 @@ FPL_API = "https://fantasy.premierleague.com/api"
 POSITION_MAP = {1: "GK", 2: "DEF", 3: "MID", 4: "FWD"}
 
 # ============================================================================
-# SLEEPER SCORING TABLE (Standard)
+# SLEEPER SCORING TABLE
 # ============================================================================
 
 SLEEPER_SCORING = {
-    "goals": {"FWD": 9, "MID": 9, "DEF": 10, "GK": 10},
-    "assists": {"FWD": 6, "MID": 6, "DEF": 7, "GK": 7},
-    "shots_on_target": 2.0,
-    "key_passes": {"FWD": 2, "MID": 2, "DEF": 2, "GK": 0},
-    "successful_dribbles": 1.0,
-    "accurate_crosses": 1.0,
-    "yellow_card": -2.0,
-    "red_card": -7.0,
-    "aerials_won": {"FWD": 0.5, "MID": 0.5, "DEF": 1.0, "GK": 1.0},
-    "effective_clearances": {"FWD": 0, "MID": 0, "DEF": 0.25, "GK": 0.25},
-    "saves": 2.0,
-    "clean_sheet_60plus": {"FWD": 0, "MID": 1, "DEF": 6, "GK": 8},
-    "tackles_won": 1.0,
-    "interceptions": 1.0,
-    "blocked_shots": 1.0,
-    "goals_against": {"FWD": 0, "MID": 0, "DEF": -2, "GK": -2},
+    "goals":                {"FWD": 9,    "MID": 9,    "DEF": 10,   "GK": 10},
+    "assists":              {"FWD": 6,    "MID": 6,    "DEF": 7,    "GK": 7},
+    "shots_on_target":      2.0,
+    "key_passes":           {"FWD": 2,    "MID": 2,    "DEF": 2,    "GK": 0},
+    "successful_dribbles":  1.0,
+    "accurate_crosses":     1.0,
+    "yellow_card":         -2.0,
+    "red_card":            -7.0,
+    "aerials_won":          {"FWD": 0.5,  "MID": 0.5,  "DEF": 1.0,  "GK": 1.0},
+    "effective_clearances": {"FWD": 0,    "MID": 0,    "DEF": 0.25, "GK": 0.25},
+    "saves":                2.0,
+    "clean_sheet_60plus":   {"FWD": 0,    "MID": 1,    "DEF": 6,    "GK": 8},
+    "tackles_won":          1.0,
+    "interceptions":        1.0,
+    "blocked_shots":        1.0,
+    "goals_against":        {"FWD": 0,    "MID": 0,    "DEF": -2,   "GK": -2},
 }
 
+# Stats that come exclusively from FBref (not in FPL API)
+FBREF_STATS = [
+    "shots_on_target",
+    "key_passes",
+    "accurate_crosses",
+    "tackles_won",
+    "interceptions",
+    "blocked_shots",
+    "effective_clearances",
+    "successful_dribbles",
+    "aerials_won",
+]
+
+# FBref stat_type → {our_name: [candidate column substrings to search for]}
+FBREF_PULL = {
+    "shooting":   {
+        "shots_on_target":      ["sot", "shots_on_target"],
+    },
+    "passing":    {
+        "key_passes":           ["kp", "key_pass"],
+        "accurate_crosses":     ["crs", "crosses"],
+    },
+    "defense":    {
+        "tackles_won":          ["tklw", "tackles_won"],
+        "interceptions":        ["int", "interceptions"],
+        "blocked_shots":        ["blocks_sh", "sh"],   # shots blocked, under Blocks group
+        "effective_clearances": ["clr", "clearances"],
+    },
+    "possession": {
+        "successful_dribbles":  ["succ", "dribbles_succ", "successful_dribbles"],
+    },
+    "misc":       {
+        "aerials_won":          ["won", "aerials_won", "aerial_won"],
+    },
+}
+
+# Stats the model is trained to predict
+TRAIN_TARGETS = [
+    "goals_scored", "assists", "expected_goals", "expected_assists",
+    "clean_sheets", "saves", "yellow_cards", "red_cards",
+    "goals_conceded",
+    # FBref targets
+    "shots_on_target", "key_passes", "accurate_crosses",
+    "tackles_won", "interceptions", "blocked_shots",
+    "effective_clearances", "successful_dribbles", "aerials_won",
+]
+
+NON_FEATURE = {"name", "team", "position", "GW", "minutes", "player_id", "was_home",
+               "status", "chance_of_playing"}
+
+FPL_ROLLING_STATS = [
+    "goals_scored", "assists", "expected_goals", "expected_assists",
+    "clean_sheets", "saves", "total_points", "influence", "creativity",
+    "threat", "goals_conceded",
+]
+
+
+# ============================================================================
+# HELPERS
+# ============================================================================
+
+def _current_season_str() -> str:
+    """Return soccerdata season string, e.g. '2526' for 2025-26."""
+    now = datetime.now()
+    y = now.year if now.month >= 8 else now.year - 1
+    return f"{str(y)[2:]}{str(y + 1)[2:]}"
+
+
+def _pos_score(key: str, pos: str) -> float:
+    v = SLEEPER_SCORING[key]
+    return v.get(pos, 0) if isinstance(v, dict) else float(v)
+
+
+# ============================================================================
+# FPL CLIENT
+# ============================================================================
 
 class FPLDataClient:
-    """Fetch FPL API data with caching."""
+    """Fetch FPL API data with local JSON caching."""
 
     def __init__(self, cache_dir: str = ".fpl_cache") -> None:
         self.cache_dir = Path(cache_dir)
@@ -83,25 +161,205 @@ class FPLDataClient:
         return data
 
     def bootstrap(self) -> dict:
-        """Main FPL: players, teams, current status."""
         return self._get_json(f"{FPL_API}/bootstrap-static/", "bootstrap", force=True)
 
-    def fixtures(self) -> list:
-        return self._get_json(f"{FPL_API}/fixtures/", "fixtures", force=True)
-
     def element_summary(self, player_id: int) -> dict:
-        """Per-player history across all GWs."""
         return self._get_json(
             f"{FPL_API}/element-summary/{player_id}/", f"element_{player_id}"
         )
 
 
-def load_current_season_data(client: FPLDataClient) -> pd.DataFrame:
-    """Pull every player's GW history for current season."""
+# ============================================================================
+# FBREF CLIENT  (soccerdata wrapper)
+# ============================================================================
+
+class FBrefDataClient:
+    """
+    Fetches per-player per-match Opta stats from FBref via soccerdata.
+    Results are cached as Parquet so subsequent runs are instant.
+    """
+
+    def __init__(self, season: str | None = None, cache_dir: str = ".fbref_cache") -> None:
+        self.season = season or _current_season_str()
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(exist_ok=True)
+
+    # -- internal helpers ---------------------------------------------------
+
+    def _flatten(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Collapse MultiIndex columns to single lowercase strings."""
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [
+                "_".join(
+                    p.strip().lower()
+                    for p in col
+                    if p.strip() and "unnamed" not in p.lower()
+                ) or str(col[-1]).strip().lower()
+                for col in df.columns
+            ]
+        else:
+            df.columns = [str(c).strip().lower() for c in df.columns]
+        return df
+
+    def _find_col(self, df: pd.DataFrame, candidates: list[str]) -> str | None:
+        """Return the first column whose name contains any candidate substring."""
+        for cand in candidates:
+            hits = [c for c in df.columns if cand in c]
+            if hits:
+                return hits[0]
+        return None
+
+    # -- public API ---------------------------------------------------------
+
+    def load_match_stats(self) -> pd.DataFrame:
+        """
+        Returns a DataFrame with columns:
+            player, GW, shots_on_target, key_passes, accurate_crosses,
+            tackles_won, interceptions, blocked_shots, effective_clearances,
+            successful_dribbles, aerials_won
+        One row per player per gameweek.
+        """
+        cache_path = self.cache_dir / f"fbref_{self.season}.parquet"
+        if cache_path.exists():
+            log.info("✓ FBref stats loaded from cache")
+            return pd.read_parquet(cache_path)
+
+        try:
+            from soccerdata import FBref  # type: ignore
+        except ImportError:
+            log.warning("⚠  soccerdata not installed — run: pip install soccerdata")
+            return pd.DataFrame()
+
+        try:
+            fbref = FBref(
+                leagues="ENG-Premier League",
+                seasons=self.season,
+                data_dir=str(self.cache_dir),
+            )
+        except Exception as e:
+            log.warning(f"⚠  FBref init failed: {e}")
+            return pd.DataFrame()
+
+        frames: list[pd.DataFrame] = []
+
+        for stat_type, targets in FBREF_PULL.items():
+            try:
+                log.info(f"🌐 FBref: {stat_type}...")
+                raw = fbref.read_player_match_stats(stat_type).reset_index()
+                raw = self._flatten(raw)
+
+                player_col = self._find_col(raw, ["player"])
+                gw_col     = self._find_col(raw, ["round", "matchweek", "gameweek"])
+                if not player_col:
+                    log.warning(f"  ↳ no player column in {stat_type}, skipping")
+                    continue
+
+                rename = {player_col: "player"}
+                if gw_col:
+                    rename[gw_col] = "gw_raw"
+
+                for stat, cands in targets.items():
+                    col = self._find_col(raw, cands)
+                    if col:
+                        rename[col] = stat
+                    else:
+                        log.warning(f"  ↳ {stat_type}/{stat}: column not found")
+
+                sub = raw[list(rename)].rename(columns=rename)
+
+                for stat in targets:
+                    if stat in sub.columns:
+                        sub[stat] = pd.to_numeric(sub[stat], errors="coerce").fillna(0.0)
+
+                frames.append(sub)
+                found = [s for s in targets if s in sub.columns]
+                log.info(f"  ↳ captured: {found}")
+
+            except AttributeError:
+                log.warning(f"  ↳ read_player_match_stats not available for {stat_type}")
+            except Exception as e:
+                log.warning(f"  ↳ FBref {stat_type} failed: {e}")
+
+        if not frames:
+            log.warning("⚠  All FBref fetches failed — advanced stats will be 0")
+            return pd.DataFrame()
+
+        merged = frames[0]
+        for frame in frames[1:]:
+            on = [c for c in ["player", "gw_raw"] if c in merged.columns and c in frame.columns]
+            merged = merged.merge(frame, on=on, how="outer")
+
+        # Parse "Matchweek 34" → 34
+        if "gw_raw" in merged.columns:
+            merged["GW"] = pd.to_numeric(
+                merged["gw_raw"].astype(str).str.extract(r"(\d+)")[0],
+                errors="coerce",
+            )
+
+        for stat in FBREF_STATS:
+            if stat not in merged.columns:
+                merged[stat] = 0.0
+
+        log.info(f"✓ FBref merged: {merged.shape[0]} player-GW rows")
+
+        try:
+            merged.to_parquet(cache_path)
+        except Exception:
+            pass  # pyarrow missing — just skip caching
+
+        return merged
+
+
+# ============================================================================
+# PLAYER NAME MATCHING
+# ============================================================================
+
+def fuzzy_match_names(fpl_names: list[str], fbref_names: list[str]) -> dict[str, str]:
+    """
+    Map FPL display names → FBref player names.
+    Strategy: exact → last-name-only → fuzzy (cutoff 0.76).
+    """
+    fb_lower = {n.lower(): n for n in fbref_names}
+    mapping: dict[str, str] = {}
+
+    for name in fpl_names:
+        low = name.lower()
+
+        # 1. Exact
+        if low in fb_lower:
+            mapping[name] = fb_lower[low]
+            continue
+
+        # 2. Last name only (unambiguous)
+        last = low.split()[-1]
+        hits = [orig for k, orig in fb_lower.items() if k.endswith(last)]
+        if len(hits) == 1:
+            mapping[name] = hits[0]
+            continue
+
+        # 3. Fuzzy
+        close = difflib.get_close_matches(low, list(fb_lower), n=1, cutoff=0.76)
+        if close:
+            mapping[name] = fb_lower[close[0]]
+
+    return mapping
+
+
+# ============================================================================
+# DATA LOADING
+# ============================================================================
+
+def load_fpl_data(client: FPLDataClient) -> pd.DataFrame:
+    """Pull per-player per-GW history from FPL API. Also captures availability."""
     boot = client.bootstrap()
     elements = pd.DataFrame(boot["elements"])
-    teams = pd.DataFrame(boot["teams"])
-    team_map = dict(zip(teams["id"], teams["short_name"]))
+    team_map = dict(zip(
+        pd.DataFrame(boot["teams"])["id"],
+        pd.DataFrame(boot["teams"])["short_name"],
+    ))
+
+    # Availability snapshot (current week)
+    avail = elements.set_index("id")[["status", "chance_of_playing_next_round"]].to_dict("index")
 
     rows = []
     for _, el in elements.iterrows():
@@ -112,75 +370,106 @@ def load_current_season_data(client: FPLDataClient) -> pd.DataFrame:
         except requests.HTTPError:
             continue
 
+        pid = int(el["id"])
+        av  = avail.get(pid, {})
+
         for gw in summary.get("history", []):
-            rows.append(
-                {
-                    "name": f"{el['first_name']} {el['second_name']}",
-                    "player_id": el["id"],
-                    "team": team_map.get(el["team"], str(el["team"])),
-                    "position": POSITION_MAP.get(el["element_type"]),
-                    "GW": gw["round"],
-                    "minutes": gw["minutes"],
-                    "goals_scored": gw["goals_scored"],
-                    "assists": gw["assists"],
-                    "clean_sheets": gw["clean_sheets"],
-                    "goals_conceded": gw["goals_conceded"],
-                    "saves": gw["saves"],
-                    "yellow_cards": gw["yellow_cards"],
-                    "red_cards": gw["red_cards"],
-                    "was_home": int(gw["was_home"]),
-                    "expected_goals": float(gw.get("expected_goals", 0) or 0),
-                    "expected_assists": float(gw.get("expected_assists", 0) or 0),
-                    "influence": float(gw["influence"]),
-                    "creativity": float(gw["creativity"]),
-                    "threat": float(gw["threat"]),
-                    "ict_index": float(gw["ict_index"]),
-                    "total_points": gw["total_points"],
-                }
-            )
+            rows.append({
+                "name":             f"{el['first_name']} {el['second_name']}",
+                "player_id":        pid,
+                "team":             team_map.get(el["team"], str(el["team"])),
+                "position":         POSITION_MAP.get(el["element_type"]),
+                "GW":               gw["round"],
+                "minutes":          gw["minutes"],
+                "goals_scored":     gw["goals_scored"],
+                "assists":          gw["assists"],
+                "clean_sheets":     gw["clean_sheets"],
+                "goals_conceded":   gw["goals_conceded"],
+                "saves":            gw["saves"],
+                "yellow_cards":     gw["yellow_cards"],
+                "red_cards":        gw["red_cards"],
+                "was_home":         int(gw["was_home"]),
+                "expected_goals":   float(gw.get("expected_goals", 0) or 0),
+                "expected_assists": float(gw.get("expected_assists", 0) or 0),
+                "influence":        float(gw["influence"]),
+                "creativity":       float(gw["creativity"]),
+                "threat":           float(gw["threat"]),
+                "ict_index":        float(gw["ict_index"]),
+                "total_points":     gw["total_points"],
+                # availability (same value stamped on every row for this player)
+                "status":               av.get("status", "a"),
+                "chance_of_playing":    av.get("chance_of_playing_next_round") or 100,
+            })
 
     df = pd.DataFrame(rows)
-    log.info(f"✓ Loaded {len(df)} player-GW records")
+    log.info(f"✓ FPL: {len(df)} player-GW records")
     return df
 
 
+def load_current_season_data(
+    fpl_client: FPLDataClient,
+    fbref_client: FBrefDataClient,
+) -> pd.DataFrame:
+    fpl_df   = load_fpl_data(fpl_client)
+    fbref_df = fbref_client.load_match_stats()
+
+    if fbref_df.empty or "player" not in fbref_df.columns or "GW" not in fbref_df.columns:
+        log.warning("⚠  FBref data unavailable — advanced stats defaulted to 0")
+        for col in FBREF_STATS:
+            fpl_df[col] = 0.0
+        return fpl_df
+
+    name_map = fuzzy_match_names(
+        fpl_df["name"].unique().tolist(),
+        fbref_df["player"].unique().tolist(),
+    )
+    pct = 100 * len(name_map) / fpl_df["name"].nunique()
+    log.info(f"✓ Name match: {len(name_map)}/{fpl_df['name'].nunique()} ({pct:.0f}%)")
+
+    fpl_df["_fb"] = fpl_df["name"].map(name_map)
+
+    stat_cols   = [c for c in FBREF_STATS if c in fbref_df.columns]
+    fbref_slim  = fbref_df[["player", "GW"] + stat_cols].rename(columns={"player": "_fb"})
+
+    merged = fpl_df.merge(fbref_slim, on=["_fb", "GW"], how="left")
+
+    for col in FBREF_STATS:
+        if col not in merged.columns:
+            merged[col] = 0.0
+        else:
+            merged[col] = merged[col].fillna(0.0)
+
+    merged.drop(columns=["_fb"], inplace=True)
+    log.info(f"✓ Merged dataset: {merged.shape}")
+    return merged
+
+
+# ============================================================================
+# FEATURE ENGINEERING
+# ============================================================================
+
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Build lagged rolling features (never leak future info)."""
+    """Lagged rolling averages for every stat — no future leakage."""
     df = df.sort_values(["name", "GW"]).reset_index(drop=True)
 
+    all_stats = FPL_ROLLING_STATS + FBREF_STATS
+
     for window in [3, 5, 10]:
-        for stat in [
-            "goals_scored",
-            "assists",
-            "expected_goals",
-            "expected_assists",
-            "clean_sheets",
-            "saves",
-            "total_points",
-            "influence",
-            "creativity",
-            "threat",
-        ]:
-            col = f"{stat}_avg{window}"
-            df[col] = (
+        for stat in all_stats:
+            if stat not in df.columns:
+                continue
+            df[f"{stat}_avg{window}"] = (
                 df.groupby("name")[stat]
-                .transform(
-                    lambda s, w=window: s.shift(1).rolling(w, min_periods=1).mean()
-                )
+                .transform(lambda s, w=window: s.shift(1).rolling(w, min_periods=1).mean())
             )
 
-        # Minutes reliability (critical for Sleeper)
         df[f"minutes_avg{window}"] = (
             df.groupby("name")["minutes"]
-            .transform(
-                lambda s, w=window: s.shift(1).rolling(w, min_periods=1).mean()
-            )
+            .transform(lambda s, w=window: s.shift(1).rolling(w, min_periods=1).mean())
         )
         df[f"starts_rate{window}"] = (
             df.groupby("name")["minutes"]
-            .transform(
-                lambda s, w=window: (s.shift(1) >= 60).rolling(w, min_periods=1).mean()
-            )
+            .transform(lambda s, w=window: (s.shift(1) >= 60).rolling(w, min_periods=1).mean())
         )
 
     df["games_played"] = df.groupby("name").cumcount()
@@ -190,31 +479,15 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def train_component_models(df: pd.DataFrame) -> dict:
-    """Train one model per (position, stat) using time-series CV."""
-    non_feature = {
-        "name",
-        "team",
-        "position",
-        "GW",
-        "minutes",
-        "player_id",
-        "was_home",
-    }
-    feature_cols = [c for c in df.columns if c not in non_feature]
+# ============================================================================
+# MODEL TRAINING
+# ============================================================================
 
-    targets = [
-        "goals_scored",
-        "assists",
-        "expected_goals",
-        "expected_assists",
-        "clean_sheets",
-        "saves",
-        "yellow_cards",
-        "red_cards",
-    ]
+def train_component_models(df: pd.DataFrame) -> tuple[dict, list]:
+    """One LGBMRegressor per (position, target stat), time-series CV."""
+    feature_cols = [c for c in df.columns if c not in NON_FEATURE]
 
-    bundle = {}
+    bundle: dict = {}
     for pos in ["GK", "DEF", "MID", "FWD"]:
         sub = df[df["position"] == pos].copy()
         if len(sub) < 50:
@@ -223,194 +496,197 @@ def train_component_models(df: pd.DataFrame) -> dict:
         bundle[pos] = {}
         log.info(f"Training {pos}...")
 
-        for target in targets:
-            if target not in sub.columns or sub[target].sum() == 0:
+        for target in TRAIN_TARGETS:
+            if target not in sub.columns:
+                continue
+            y = sub[target].fillna(0)
+            if y.sum() == 0:
                 continue
 
             X = sub[feature_cols].fillna(0)
-            y = sub[target].fillna(0)
 
-            # Quick time-series CV
             tscv = TimeSeriesSplit(n_splits=2)
-            errs = []
-            for tr_idx, te_idx in tscv.split(X):
-                m = LGBMRegressor(
-                    n_estimators=200,
-                    learning_rate=0.1,
-                    num_leaves=31,
-                    verbose=-1,
-                    random_state=42,
-                )
-                m.fit(X.iloc[tr_idx], y.iloc[tr_idx])
-                pred = m.predict(X.iloc[te_idx])
-                errs.append(mean_absolute_error(y.iloc[te_idx], pred))
+            for tr, te in tscv.split(X):
+                m = LGBMRegressor(n_estimators=200, learning_rate=0.1, num_leaves=31,
+                                  verbose=-1, random_state=42)
+                m.fit(X.iloc[tr], y.iloc[tr])
 
-            # Train final model
-            m = LGBMRegressor(
-                n_estimators=200,
-                learning_rate=0.1,
-                num_leaves=31,
-                verbose=-1,
-                random_state=42,
-            )
+            m = LGBMRegressor(n_estimators=200, learning_rate=0.1, num_leaves=31,
+                              verbose=-1, random_state=42)
             m.fit(X, y)
-            bundle[pos][target] = (m, feature_cols)
+            bundle[pos][target] = m
 
     return bundle, feature_cols
 
 
-def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list) -> pd.DataFrame:
-    """Predict Sleeper points for next gameweek."""
-    current_gw = df["GW"].max()
-    next_gw = current_gw + 1
+# ============================================================================
+# PREDICTION  +  FULL SLEEPER SCORING
+# ============================================================================
 
-    # Use latest features per player
+def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list) -> pd.DataFrame:
+    next_gw = int(df["GW"].max()) + 1
     base = df.sort_values("GW").groupby("name").tail(1).copy()
     base["GW"] = next_gw
 
-    predictions = []
+    rows = []
     for _, row in base.iterrows():
         pos = row["position"]
         if pos not in bundle:
             continue
 
+        # Availability multiplier
+        status = row.get("status", "a")
+        chance = float(row.get("chance_of_playing", 100))
+        if status in ("i", "s") or chance == 0:
+            avail_mult = 0.0
+        elif status == "d":
+            avail_mult = chance / 100
+        else:
+            avail_mult = 1.0
+
         x = row[feature_cols].fillna(0).to_frame().T
 
-        # Predict each stat
-        stats = {}
-        for target, (model, _) in bundle[pos].items():
-            stats[target] = max(0.0, float(model.predict(x)[0]))
+        s: dict[str, float] = {
+            t: max(0.0, float(bundle[pos][t].predict(x)[0]))
+            for t in bundle[pos]
+        }
 
-        exp_minutes = float(row.get("minutes_avg5", 60))
+        exp_min = float(row.get("minutes_avg5", 60))
+        prob_cs = s.get("clean_sheets", 0) * min(1.0, exp_min / 60)
 
-        # Sleeper scoring
-        pts = 0.0
-        pts += stats.get("goals_scored", 0) * SLEEPER_SCORING["goals"].get(pos, 0)
-        pts += stats.get("assists", 0) * SLEEPER_SCORING["assists"].get(pos, 0)
-        pts += stats.get("yellow_cards", 0) * SLEEPER_SCORING["yellow_card"]
-        pts += stats.get("red_cards", 0) * SLEEPER_SCORING["red_card"]
+        # Full Sleeper point formula — every scoring category
+        pts = (
+            s.get("goals_scored",        0) * _pos_score("goals", pos)
+          + s.get("assists",             0) * _pos_score("assists", pos)
+          + s.get("shots_on_target",     0) * SLEEPER_SCORING["shots_on_target"]
+          + s.get("key_passes",          0) * _pos_score("key_passes", pos)
+          + s.get("successful_dribbles", 0) * SLEEPER_SCORING["successful_dribbles"]
+          + s.get("accurate_crosses",    0) * SLEEPER_SCORING["accurate_crosses"]
+          + s.get("yellow_cards",        0) * SLEEPER_SCORING["yellow_card"]
+          + s.get("red_cards",           0) * SLEEPER_SCORING["red_card"]
+          + s.get("aerials_won",         0) * _pos_score("aerials_won", pos)
+          + s.get("effective_clearances",0) * _pos_score("effective_clearances", pos)
+          + s.get("saves",               0) * SLEEPER_SCORING["saves"]
+          + prob_cs                         * _pos_score("clean_sheet_60plus", pos)
+          + s.get("tackles_won",         0) * SLEEPER_SCORING["tackles_won"]
+          + s.get("interceptions",       0) * SLEEPER_SCORING["interceptions"]
+          + s.get("blocked_shots",       0) * SLEEPER_SCORING["blocked_shots"]
+          + s.get("goals_conceded",      0) * _pos_score("goals_against", pos)
+        ) * avail_mult
 
-        # Clean sheet (gates on minutes)
-        prob_cs = stats.get("clean_sheets", 0) * min(1.0, exp_minutes / 60)
-        pts += prob_cs * SLEEPER_SCORING["clean_sheet_60plus"].get(pos, 0)
+        rows.append({
+            "name":         row["name"],
+            "team":         row["team"],
+            "position":     pos,
+            "GW":           next_gw,
+            "avail":        f"{int(chance)}%" if status != "a" else "OK",
+            "exp_min":      round(exp_min, 1),
+            "exp_goals":    round(s.get("goals_scored",        0), 2),
+            "exp_assists":  round(s.get("assists",             0), 2),
+            "exp_sot":      round(s.get("shots_on_target",     0), 2),
+            "exp_kp":       round(s.get("key_passes",          0), 2),
+            "exp_tkl":      round(s.get("tackles_won",         0), 2),
+            "exp_int":      round(s.get("interceptions",       0), 2),
+            "exp_saves":    round(s.get("saves",               0), 2),
+            "exp_cs":       round(prob_cs,                         2),
+            "sleeper_pts":  round(pts,                             2),
+        })
 
-        # Saves (mostly GK)
-        pts += stats.get("saves", 0) * SLEEPER_SCORING["saves"]
-
-        # Goals against (DEF/GK penalty)
-        pts += stats.get("goals_conceded", 0) * SLEEPER_SCORING["goals_against"].get(
-            pos, 0
-        )
-
-        # Expected goal involvement as proxy for advanced attacking potential
-        pts += stats.get("expected_goals", 0) * 2.5  # bonus for underlying threat
-        pts += stats.get("expected_assists", 0) * 2.5
-
-        predictions.append(
-            {
-                "name": row["name"],
-                "team": row["team"],
-                "position": pos,
-                "GW": next_gw,
-                "exp_minutes": round(exp_minutes, 1),
-                "exp_goals": round(stats.get("goals_scored", 0), 2),
-                "exp_assists": round(stats.get("assists", 0), 2),
-                "exp_saves": round(stats.get("saves", 0), 2),
-                "exp_cs": round(prob_cs, 2),
-                "sleeper_pts": round(pts, 2),
-            }
-        )
-
-    result = pd.DataFrame(predictions)
-    result = result.sort_values("sleeper_pts", ascending=False)
+    result = pd.DataFrame(rows).sort_values("sleeper_pts", ascending=False)
     log.info(f"✓ Predicted {len(result)} players for GW{next_gw}")
     return result
 
 
+# ============================================================================
+# INTERACTIVE CLI
+# ============================================================================
+
+_DISPLAY_COLS = ["name", "team", "position", "avail", "exp_min",
+                 "exp_goals", "exp_assists", "exp_sot", "exp_tkl", "exp_int",
+                 "exp_saves", "exp_cs", "sleeper_pts"]
+
+
 def print_menu(predictions: pd.DataFrame) -> None:
-    """Interactive CLI to explore predictions."""
     while True:
-        print("\n" + "=" * 80)
-        print(f"⚽ SLEEPER FANTASY GW{predictions['GW'].iloc[0]} PREDICTOR")
-        print("=" * 80)
+        print("\n" + "=" * 90)
+        print(f"⚽  SLEEPER FANTASY  GW{predictions['GW'].iloc[0]}  PREDICTOR")
+        print("=" * 90)
         print("\nOptions:")
         print("  [1] Top 20 all positions")
-        print("  [2] Top 10 by position (GK, DEF, MID, FWD)")
+        print("  [2] Top 10 by position")
         print("  [3] Filter by team")
         print("  [4] Filter by position + min expected points")
-        print("  [5] Export to CSV")
-        print("  [6] Exit")
+        print("  [5] Show stat breakdown for a player")
+        print("  [6] Export to CSV")
+        print("  [7] Exit")
         print()
 
-        choice = input("Choose (1-6): ").strip()
+        choice = input("Choose (1-7): ").strip()
 
         if choice == "1":
             print("\n🏆 TOP 20 SLEEPER SCORERS\n")
-            print(
-                predictions.head(20)[
-                    ["name", "team", "position", "exp_minutes", "sleeper_pts"]
-                ]
-                .to_string(index=False)
-            )
+            print(predictions.head(20)[_DISPLAY_COLS].to_string(index=False))
 
         elif choice == "2":
-            print()
             for pos in ["GK", "DEF", "MID", "FWD"]:
                 sub = predictions[predictions["position"] == pos].head(10)
-                if len(sub) > 0:
-                    print(f"\n{pos}:")
-                    print(
-                        sub[
-                            ["name", "team", "exp_minutes", "sleeper_pts"]
-                        ].to_string(index=False)
-                    )
+                if not sub.empty:
+                    print(f"\n── {pos} ──")
+                    print(sub[_DISPLAY_COLS].to_string(index=False))
 
         elif choice == "3":
-            team = input("Team (e.g., ARS, MUN, LIV): ").upper()
+            team = input("Team short code (e.g. ARS, LIV, MCI): ").upper()
             sub = predictions[predictions["team"] == team].head(20)
-            if len(sub) > 0:
+            if not sub.empty:
                 print(f"\n{team} PLAYERS:\n")
-                print(
-                    sub[["name", "position", "exp_minutes", "sleeper_pts"]].to_string(
-                        index=False
-                    )
-                )
+                print(sub[_DISPLAY_COLS].to_string(index=False))
             else:
-                print(f"No predictions for {team}")
+                print(f"No predictions found for {team}")
 
         elif choice == "4":
-            pos = input("Position (GK/DEF/MID/FWD): ").upper()
+            pos     = input("Position (GK/DEF/MID/FWD): ").upper()
             min_pts = float(input("Minimum expected points: "))
             sub = predictions[
                 (predictions["position"] == pos) & (predictions["sleeper_pts"] >= min_pts)
             ]
-            if len(sub) > 0:
-                print(f"\n{pos} PLAYERS >= {min_pts} PTS:\n")
-                print(
-                    sub[["name", "team", "exp_minutes", "sleeper_pts"]].to_string(
-                        index=False
-                    )
-                )
+            if not sub.empty:
+                print(f"\n{pos} players ≥ {min_pts} pts:\n")
+                print(sub[_DISPLAY_COLS].to_string(index=False))
             else:
-                print(f"No {pos} found with {min_pts}+ pts")
+                print(f"No {pos} players found above {min_pts} pts")
 
         elif choice == "5":
+            name = input("Player name (partial OK): ").lower()
+            sub = predictions[predictions["name"].str.lower().str.contains(name)]
+            if not sub.empty:
+                print()
+                print(sub[_DISPLAY_COLS].to_string(index=False))
+            else:
+                print("Player not found")
+
+        elif choice == "6":
             fname = f"sleeper_gw{predictions['GW'].iloc[0]}.csv"
             predictions.to_csv(fname, index=False)
             log.info(f"✓ Saved to {fname}")
 
-        elif choice == "6":
+        elif choice == "7":
             print("\nGoodbye! ⚽")
             break
 
 
-def main():
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main() -> None:
     log.info("🚀 SLEEPER FANTASY PREMIER LEAGUE PREDICTOR")
     log.info("=" * 50)
 
-    client = FPLDataClient()
-    df = load_current_season_data(client)
-    feat = engineer_features(df)
+    fpl_client   = FPLDataClient()
+    fbref_client = FBrefDataClient()
+
+    df          = load_current_season_data(fpl_client, fbref_client)
+    feat        = engineer_features(df)
     bundle, feature_cols = train_component_models(feat)
     predictions = predict_next_gw(feat, bundle, feature_cols)
 
