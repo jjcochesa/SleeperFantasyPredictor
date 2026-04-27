@@ -67,7 +67,7 @@ TRAIN_TARGETS = [
 ]
 
 NON_FEATURE = {"name", "display_name", "team", "position", "GW", "minutes",
-               "player_id", "status", "chance_of_playing", "price"}
+               "player_id", "status", "chance_of_playing"}
 
 FPL_ROLLING_STATS = [
     "goals_scored", "assists", "expected_goals", "expected_assists",
@@ -172,7 +172,6 @@ def load_fpl_data(client: FPLDataClient, boot: dict) -> pd.DataFrame:
             rows.append({
                 "name":             f"{el['first_name']} {el['second_name']}",
                 "display_name":     el.get("web_name", el["second_name"]),
-                "price":            round(el["now_cost"] / 10, 1),
                 "player_id":        pid,
                 "team":             team_map.get(el["team"], str(el["team"])),
                 "position":         POSITION_MAP.get(el["element_type"]),
@@ -396,8 +395,10 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
         if f.get("event") == next_gw:
             h = tid2name.get(f["team_h"], "")
             a = tid2name.get(f["team_a"], "")
-            next_fix[h] = {"opp": a, "is_home": 1}
-            next_fix[a] = {"opp": h, "is_home": 0}
+            next_fix[h] = {"opp": a, "is_home": 1,
+                           "fdr": f.get("team_h_difficulty", 3)}
+            next_fix[a] = {"opp": h, "is_home": 0,
+                           "fdr": f.get("team_a_difficulty", 3)}
     latest_ts = ts.sort_values("GW").groupby("team").last()
     for idx, row in base.iterrows():
         fi   = next_fix.get(row["team"], {})
@@ -407,6 +408,8 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
         side = "away" if ih else "home"
         st   = str_df.get(opp, {})
         base.at[idx, "opp"]          = opp or "TBC"
+        base.at[idx, "ha"]           = "H" if ih else "A"
+        base.at[idx, "fdr"]          = fi.get("fdr", 3)
         base.at[idx, "was_home"]     = ih
         base.at[idx, "opp_gc_avg5"]  = os.get("team_goals_conceded_avg5", 1.2)
         base.at[idx, "opp_xgc_avg5"] = os.get("team_xg_conceded_avg5", 1.2)
@@ -503,11 +506,12 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
             "display_name": row.get("display_name", row["name"]),
             "team":         row["team"],
             "opp":          row.get("opp", "TBC"),
+            "ha":           row.get("ha", "?"),
+            "fdr":          int(row.get("fdr", 3)),
             "position":     pos,
             "form":         form,
             "GW":           next_gw,
             "avail":        f"{int(chance)}%" if status != "a" else "OK",
-            "price":        round(float(row.get("price", 0)), 1),
             "exp_min":      round(exp_min, 1),
             "exp_goals":    round(s.get("goals_scored", 0) * min_scale, 2),
             "exp_assists":  round(s.get("assists",       0) * min_scale, 2),
@@ -529,7 +533,7 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
 # INTERACTIVE CLI
 # ============================================================================
 
-_DISPLAY_COLS = ["display_name", "team", "opp", "position", "form", "avail", "price",
+_DISPLAY_COLS = ["display_name", "team", "opp", "ha", "fdr", "position", "form", "avail",
                  "exp_goals", "exp_assists", "exp_sot", "exp_kp", "exp_tkl", "exp_int",
                  "exp_saves", "exp_cs", "sleeper_pts"]
 
