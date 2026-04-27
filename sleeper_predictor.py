@@ -244,7 +244,7 @@ class FBrefDataClient:
             fbref = FBref(
                 leagues="ENG-Premier League",
                 seasons=self.season,
-                data_dir=str(self.cache_dir),
+                data_dir=self.cache_dir,
             )
         except Exception as e:
             log.warning(f"⚠  FBref init failed: {e}")
@@ -648,7 +648,7 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
         else:
             avail_mult = 1.0
 
-        x = row[feature_cols].fillna(0).to_frame().T
+        x = row[feature_cols].fillna(0).to_frame().T.astype(float)
 
         s: dict[str, float] = {
             t: max(0.0, float(bundle[pos][t].predict(x)[0]))
