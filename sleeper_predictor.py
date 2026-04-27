@@ -110,13 +110,13 @@ TRAIN_TARGETS = [
     "effective_clearances", "successful_dribbles", "aerials_won",
 ]
 
-NON_FEATURE = {"name", "team", "position", "GW", "minutes", "player_id", "was_home",
+NON_FEATURE = {"name", "team", "position", "GW", "minutes", "player_id",
                "status", "chance_of_playing"}
 
 FPL_ROLLING_STATS = [
     "goals_scored", "assists", "expected_goals", "expected_assists",
     "clean_sheets", "saves", "total_points", "influence", "creativity",
-    "threat", "goals_conceded",
+    "threat", "goals_conceded", "expected_goals_conceded",
 ]
 
 
@@ -162,6 +162,9 @@ class FPLDataClient:
 
     def bootstrap(self) -> dict:
         return self._get_json(f"{FPL_API}/bootstrap-static/", "bootstrap", force=True)
+
+    def fixtures(self) -> list:
+        return self._get_json(f"{FPL_API}/fixtures/", "fixtures", force=True)
 
     def element_summary(self, player_id: int) -> dict:
         return self._get_json(
@@ -349,9 +352,8 @@ def fuzzy_match_names(fpl_names: list[str], fbref_names: list[str]) -> dict[str,
 # DATA LOADING
 # ============================================================================
 
-def load_fpl_data(client: FPLDataClient) -> pd.DataFrame:
+def load_fpl_data(client: FPLDataClient, boot: dict) -> pd.DataFrame:
     """Pull per-player per-GW history from FPL API. Also captures availability."""
-    boot = client.bootstrap()
     elements = pd.DataFrame(boot["elements"])
     team_map = dict(zip(
         pd.DataFrame(boot["teams"])["id"],
@@ -395,8 +397,8 @@ def load_fpl_data(client: FPLDataClient) -> pd.DataFrame:
                 "creativity":       float(gw["creativity"]),
                 "threat":           float(gw["threat"]),
                 "ict_index":        float(gw["ict_index"]),
-                "total_points":     gw["total_points"],
-                # availability (same value stamped on every row for this player)
+                "total_points":            gw["total_points"],
+                "expected_goals_conceded": float(gw.get("expected_goals_conceded", 0) or 0),
                 "status":               av.get("status", "a"),
                 "chance_of_playing":    av.get("chance_of_playing_next_round") or 100,
             })
@@ -406,42 +408,99 @@ def load_fpl_data(client: FPLDataClient) -> pd.DataFrame:
     return df
 
 
+def build_team_gw_stats(df: pd.DataFrame) -> pd.DataFrame:
+    gk = df[df["position"] == "GK"]
+    def_stats = gk.groupby(["team", "GW"]).agg(
+        team_goals_conceded=("goals_conceded", "first"),
+        team_xg_conceded=("expected_goals_conceded", "first"),
+    ).reset_index()
+    att_stats = df.groupby(["team", "GW"]).agg(
+        team_goals_scored=("goals_scored", "sum"),
+        team_xg_scored=("expected_goals", "sum"),
+    ).reset_index()
+    ts = att_stats.merge(def_stats, on=["team", "GW"], how="left").sort_values(["team", "GW"])
+    for w in [3, 5]:
+        for col in ["team_goals_conceded", "team_xg_conceded", "team_goals_scored", "team_xg_scored"]:
+            if col in ts.columns:
+                ts[f"{col}_avg{w}"] = ts.groupby("team")[col].transform(
+                    lambda s, ww=w: s.shift(1).rolling(ww, min_periods=1).mean())
+    return ts
+
+
+def enrich_with_fixture_context(df: pd.DataFrame, ts: pd.DataFrame,
+                                fixtures: list, boot: dict) -> pd.DataFrame:
+    teams_df = pd.DataFrame(boot["teams"])
+    tid2name = dict(zip(teams_df["id"], teams_df["short_name"]))
+    str_df = teams_df[["short_name", "strength_attack_home", "strength_attack_away",
+                        "strength_defence_home", "strength_defence_away"]].rename(
+                            columns={"short_name": "opp"})
+    fix_rows = []
+    for f in fixtures:
+        gw = f.get("event")
+        if not gw:
+            continue
+        h, a = tid2name.get(f["team_h"], ""), tid2name.get(f["team_a"], "")
+        fix_rows += [{"team": h, "GW": gw, "opp": a, "was_home": 1},
+                     {"team": a, "GW": gw, "opp": h, "was_home": 0}]
+    fdf = pd.DataFrame(fix_rows)
+    opp_cols = ["team", "GW", "team_goals_conceded_avg5", "team_xg_conceded_avg5",
+                "team_goals_scored_avg5", "team_xg_scored_avg5"]
+    odf = ts[[c for c in opp_cols if c in ts.columns]].rename(
+        columns={"team": "opp", "team_goals_conceded_avg5": "opp_gc_avg5",
+                 "team_xg_conceded_avg5": "opp_xgc_avg5",
+                 "team_goals_scored_avg5": "opp_gs_avg5",
+                 "team_xg_scored_avg5": "opp_xgs_avg5"})
+    fdf = fdf.merge(odf, on=["opp", "GW"], how="left")
+    fdf = fdf.merge(str_df, on="opp", how="left")
+    fdf["opp_att_str"] = fdf.apply(lambda r: r["strength_attack_away"] if r["was_home"] == 1
+                                   else r["strength_attack_home"], axis=1)
+    fdf["opp_def_str"] = fdf.apply(lambda r: r["strength_defence_away"] if r["was_home"] == 1
+                                   else r["strength_defence_home"], axis=1)
+    fdf = fdf.drop(columns=["opp", "strength_attack_home", "strength_attack_away",
+                             "strength_defence_home", "strength_defence_away"])
+    for c in ["opp_gc_avg5", "opp_xgc_avg5", "opp_gs_avg5", "opp_xgs_avg5"]:
+        fdf[c] = fdf[c].fillna(1.2)
+    fdf[["opp_att_str", "opp_def_str"]] = fdf[["opp_att_str", "opp_def_str"]].fillna(1000)
+    df = df.drop(columns=["was_home"], errors="ignore")
+    return df.merge(fdf, on=["team", "GW"], how="left")
+
+
 def load_current_season_data(
     fpl_client: FPLDataClient,
     fbref_client: FBrefDataClient,
-) -> pd.DataFrame:
-    fpl_df   = load_fpl_data(fpl_client)
+    boot: dict,
+    fixtures: list,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    fpl_df   = load_fpl_data(fpl_client, boot)
     fbref_df = fbref_client.load_match_stats()
 
     if fbref_df.empty or "player" not in fbref_df.columns or "GW" not in fbref_df.columns:
         log.warning("⚠  FBref data unavailable — advanced stats defaulted to 0")
         for col in FBREF_STATS:
             fpl_df[col] = 0.0
-        return fpl_df
+        df = fpl_df
+    else:
+        name_map = fuzzy_match_names(
+            fpl_df["name"].unique().tolist(),
+            fbref_df["player"].unique().tolist(),
+        )
+        pct = 100 * len(name_map) / fpl_df["name"].nunique()
+        log.info(f"✓ Name match: {len(name_map)}/{fpl_df['name'].nunique()} ({pct:.0f}%)")
+        fpl_df["_fb"] = fpl_df["name"].map(name_map)
+        stat_cols  = [c for c in FBREF_STATS if c in fbref_df.columns]
+        fbref_slim = fbref_df[["player", "GW"] + stat_cols].rename(columns={"player": "_fb"})
+        df = fpl_df.merge(fbref_slim, on=["_fb", "GW"], how="left")
+        for col in FBREF_STATS:
+            if col not in df.columns:
+                df[col] = 0.0
+            else:
+                df[col] = df[col].fillna(0.0)
+        df.drop(columns=["_fb"], inplace=True)
+        log.info(f"✓ Merged dataset: {df.shape}")
 
-    name_map = fuzzy_match_names(
-        fpl_df["name"].unique().tolist(),
-        fbref_df["player"].unique().tolist(),
-    )
-    pct = 100 * len(name_map) / fpl_df["name"].nunique()
-    log.info(f"✓ Name match: {len(name_map)}/{fpl_df['name'].nunique()} ({pct:.0f}%)")
-
-    fpl_df["_fb"] = fpl_df["name"].map(name_map)
-
-    stat_cols   = [c for c in FBREF_STATS if c in fbref_df.columns]
-    fbref_slim  = fbref_df[["player", "GW"] + stat_cols].rename(columns={"player": "_fb"})
-
-    merged = fpl_df.merge(fbref_slim, on=["_fb", "GW"], how="left")
-
-    for col in FBREF_STATS:
-        if col not in merged.columns:
-            merged[col] = 0.0
-        else:
-            merged[col] = merged[col].fillna(0.0)
-
-    merged.drop(columns=["_fb"], inplace=True)
-    log.info(f"✓ Merged dataset: {merged.shape}")
-    return merged
+    ts = build_team_gw_stats(df)
+    df = enrich_with_fixture_context(df, ts, fixtures, boot)
+    return df, ts
 
 
 # ============================================================================
@@ -471,6 +530,15 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
             df.groupby("name")["minutes"]
             .transform(lambda s, w=window: (s.shift(1) >= 60).rolling(w, min_periods=1).mean())
         )
+
+    for span in [3, 5, 10]:
+        for stat in all_stats:
+            if stat not in df.columns:
+                continue
+            df[f"{stat}_ewm{span}"] = (
+                df.groupby("name")[stat]
+                .transform(lambda s, sp=span: s.shift(1).ewm(span=sp, min_periods=1).mean())
+            )
 
     df["games_played"] = df.groupby("name").cumcount()
     df = df.dropna(subset=["minutes_avg5"])
@@ -523,10 +591,39 @@ def train_component_models(df: pd.DataFrame) -> tuple[dict, list]:
 # PREDICTION  +  FULL SLEEPER SCORING
 # ============================================================================
 
-def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list) -> pd.DataFrame:
+def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
+                    ts: pd.DataFrame, fixtures: list, boot: dict) -> pd.DataFrame:
     next_gw = int(df["GW"].max()) + 1
     base = df.sort_values("GW").groupby("name").tail(1).copy()
     base["GW"] = next_gw
+
+    teams_df = pd.DataFrame(boot["teams"])
+    tid2name = dict(zip(teams_df["id"], teams_df["short_name"]))
+    str_df = teams_df.set_index("short_name")[
+        ["strength_attack_home", "strength_attack_away",
+         "strength_defence_home", "strength_defence_away"]].to_dict("index")
+    next_fix = {}
+    for f in fixtures:
+        if f.get("event") == next_gw:
+            h = tid2name.get(f["team_h"], "")
+            a = tid2name.get(f["team_a"], "")
+            next_fix[h] = {"opp": a, "is_home": 1}
+            next_fix[a] = {"opp": h, "is_home": 0}
+    latest_ts = ts.sort_values("GW").groupby("team").last()
+    for idx, row in base.iterrows():
+        fi   = next_fix.get(row["team"], {})
+        ih   = fi.get("is_home", 1)
+        opp  = fi.get("opp", "")
+        os   = latest_ts.loc[opp].to_dict() if opp in latest_ts.index else {}
+        side = "away" if ih else "home"
+        st   = str_df.get(opp, {})
+        base.at[idx, "was_home"]     = ih
+        base.at[idx, "opp_gc_avg5"]  = os.get("team_goals_conceded_avg5", 1.2)
+        base.at[idx, "opp_xgc_avg5"] = os.get("team_xg_conceded_avg5", 1.2)
+        base.at[idx, "opp_gs_avg5"]  = os.get("team_goals_scored_avg5", 1.2)
+        base.at[idx, "opp_xgs_avg5"] = os.get("team_xg_scored_avg5", 1.2)
+        base.at[idx, "opp_att_str"]  = st.get(f"strength_attack_{side}", 1000)
+        base.at[idx, "opp_def_str"]  = st.get(f"strength_defence_{side}", 1000)
 
     rows = []
     for _, row in base.iterrows():
@@ -612,7 +709,7 @@ def print_menu(predictions: pd.DataFrame) -> None:
         print(f"⚽  SLEEPER FANTASY  GW{predictions['GW'].iloc[0]}  PREDICTOR")
         print("=" * 90)
         print("\nOptions:")
-        print("  [1] Top 20 all positions")
+        print("  [1] Top 50 all positions")
         print("  [2] Top 10 by position")
         print("  [3] Filter by team")
         print("  [4] Filter by position + min expected points")
@@ -624,8 +721,8 @@ def print_menu(predictions: pd.DataFrame) -> None:
         choice = input("Choose (1-7): ").strip()
 
         if choice == "1":
-            print("\n🏆 TOP 20 SLEEPER SCORERS\n")
-            print(predictions.head(20)[_DISPLAY_COLS].to_string(index=False))
+            print("\n🏆 TOP 50 SLEEPER SCORERS\n")
+            print(predictions.head(50)[_DISPLAY_COLS].to_string(index=False))
 
         elif choice == "2":
             for pos in ["GK", "DEF", "MID", "FWD"]:
@@ -684,12 +781,12 @@ def main() -> None:
 
     fpl_client   = FPLDataClient()
     fbref_client = FBrefDataClient()
-
-    df          = load_current_season_data(fpl_client, fbref_client)
-    feat        = engineer_features(df)
+    boot         = fpl_client.bootstrap()
+    fixtures     = fpl_client.fixtures()
+    df, ts       = load_current_season_data(fpl_client, fbref_client, boot, fixtures)
+    feat         = engineer_features(df)
     bundle, feature_cols = train_component_models(feat)
-    predictions = predict_next_gw(feat, bundle, feature_cols)
-
+    predictions  = predict_next_gw(feat, bundle, feature_cols, ts, fixtures, boot)
     print_menu(predictions)
 
 
