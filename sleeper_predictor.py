@@ -147,7 +147,14 @@ class FPLDataClient:
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True)
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "sleeper-predictor/1.0"})
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-GB,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Referer": "https://fantasy.premierleague.com/",
+            "Origin": "https://fantasy.premierleague.com",
+        })
 
     def _get_json(self, url: str, cache_key: str, force: bool = False) -> dict:
         cache_path = self.cache_dir / f"{cache_key}.json"
