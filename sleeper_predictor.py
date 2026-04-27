@@ -2,24 +2,17 @@
 Sleeper Fantasy Premier League Weekly Predictor
 ================================================
 
-Data sources
-  • FPL API  – goals, assists, clean sheets, saves, cards, goals conceded,
-               minutes, xG, xA, ICT index, player availability
-  • FBref    – shots on target, key passes, accurate crosses, tackles won,
-               interceptions, blocked shots, clearances, dribbles, aerials
-
-These are the same Opta stats Sleeper uses for scoring.
+Data source: FPL API — goals, assists, clean sheets, saves, cards,
+goals conceded, minutes, xG, xA, ICT index, player availability,
+own goals, penalties missed/saved.
 
 Usage:
     python sleeper_predictor.py
 
 Requirements:
-    pip install requests pandas lightgbm numpy scikit-learn soccerdata pyarrow
-
-Author: Sleeper Predictor for Juan
+    pip install requests pandas lightgbm numpy scikit-learn pyarrow
 """
 
-import difflib
 import json
 import logging
 import warnings
@@ -29,8 +22,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import requests
-from lightgbm import LGBMRegressor
-from sklearn.metrics import mean_absolute_error
+from lightgbm import LGBMRegressor, early_stopping as lgb_early_stopping
 from sklearn.model_selection import TimeSeriesSplit
 
 warnings.filterwarnings("ignore")
@@ -67,40 +59,11 @@ SLEEPER_SCORING = {
     "penalties_saved":       8.0,
 }
 
-# Stats that come exclusively from FBref (not in FPL API)
-FBREF_STATS = [
-    "shots_on_target",
-    "key_passes",
-    "accurate_crosses",
-    "tackles_won",
-    "interceptions",
-    "blocked_shots",
-    "effective_clearances",
-    "successful_dribbles",
-    "aerials_won",
-]
-
-# FBref stat_type → {our_name: [candidate column substrings to search for]}
-# soccerdata FBref only supports 'summary' and 'keepers' for match-level stats
-FBREF_PULL = {
-    "summary": {
-        "shots_on_target": ["sot", "shots_on_target"],
-        "key_passes":      ["kp", "key_pass", "xag"],
-        "accurate_crosses":["crs", "crosses"],
-        "successful_dribbles": ["succ", "dribbles_succ"],
-        "aerials_won":     ["aerials_won", "aerial_won", "won"],
-    },
-}
-
 # Stats the model is trained to predict
 TRAIN_TARGETS = [
     "goals_scored", "assists", "expected_goals", "expected_assists",
     "clean_sheets", "saves", "yellow_cards", "red_cards",
     "goals_conceded", "own_goals", "penalties_missed", "penalties_saved",
-    # FBref targets
-    "shots_on_target", "key_passes", "accurate_crosses",
-    "tackles_won", "interceptions", "blocked_shots",
-    "effective_clearances", "successful_dribbles", "aerials_won",
 ]
 
 NON_FEATURE = {"name", "team", "position", "GW", "minutes", "player_id",
@@ -174,179 +137,8 @@ class FPLDataClient:
 
 
 # ============================================================================
-# FBREF CLIENT  (soccerdata wrapper)
+# DATA LOADING
 # ============================================================================
-
-class FBrefDataClient:
-    """
-    Fetches per-player per-match Opta stats from FBref via soccerdata.
-    Results are cached as Parquet so subsequent runs are instant.
-    """
-
-    def __init__(self, season: str | None = None, cache_dir: str = ".fbref_cache") -> None:
-        self.season = season or _current_season_str()
-        self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(exist_ok=True)
-
-    # -- internal helpers ---------------------------------------------------
-
-    def _flatten(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Collapse MultiIndex columns to single lowercase strings."""
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [
-                "_".join(
-                    p.strip().lower()
-                    for p in col
-                    if p.strip() and "unnamed" not in p.lower()
-                ) or str(col[-1]).strip().lower()
-                for col in df.columns
-            ]
-        else:
-            df.columns = [str(c).strip().lower() for c in df.columns]
-        return df
-
-    def _find_col(self, df: pd.DataFrame, candidates: list[str]) -> str | None:
-        """Return the first column whose name contains any candidate substring."""
-        for cand in candidates:
-            hits = [c for c in df.columns if cand in c]
-            if hits:
-                return hits[0]
-        return None
-
-    # -- public API ---------------------------------------------------------
-
-    def load_match_stats(self) -> pd.DataFrame:
-        """
-        Returns a DataFrame with columns:
-            player, GW, shots_on_target, key_passes, accurate_crosses,
-            tackles_won, interceptions, blocked_shots, effective_clearances,
-            successful_dribbles, aerials_won
-        One row per player per gameweek.
-        """
-        cache_path = self.cache_dir / f"fbref_{self.season}.parquet"
-        if cache_path.exists():
-            log.info("✓ FBref stats loaded from cache")
-            return pd.read_parquet(cache_path)
-
-        try:
-            from soccerdata import FBref  # type: ignore
-        except ImportError:
-            log.warning("⚠  soccerdata not installed — run: pip install soccerdata")
-            return pd.DataFrame()
-
-        try:
-            fbref = FBref(
-                leagues="ENG-Premier League",
-                seasons=self.season,
-                data_dir=self.cache_dir,
-            )
-        except Exception as e:
-            log.warning(f"⚠  FBref init failed: {e}")
-            return pd.DataFrame()
-
-        frames: list[pd.DataFrame] = []
-
-        for stat_type, targets in FBREF_PULL.items():
-            try:
-                log.info(f"🌐 FBref: {stat_type}...")
-                raw = fbref.read_player_match_stats(stat_type).reset_index()
-                raw = self._flatten(raw)
-
-                player_col = self._find_col(raw, ["player"])
-                gw_col     = self._find_col(raw, ["round", "matchweek", "gameweek"])
-                if not player_col:
-                    log.warning(f"  ↳ no player column in {stat_type}, skipping")
-                    continue
-
-                rename = {player_col: "player"}
-                if gw_col:
-                    rename[gw_col] = "gw_raw"
-
-                for stat, cands in targets.items():
-                    col = self._find_col(raw, cands)
-                    if col:
-                        rename[col] = stat
-                    else:
-                        log.warning(f"  ↳ {stat_type}/{stat}: column not found")
-
-                sub = raw[list(rename)].rename(columns=rename)
-
-                for stat in targets:
-                    if stat in sub.columns:
-                        sub[stat] = pd.to_numeric(sub[stat], errors="coerce").fillna(0.0)
-
-                frames.append(sub)
-                found = [s for s in targets if s in sub.columns]
-                log.info(f"  ↳ captured: {found}")
-
-            except AttributeError:
-                log.warning(f"  ↳ read_player_match_stats not available for {stat_type}")
-            except Exception as e:
-                log.warning(f"  ↳ FBref {stat_type} failed: {e}")
-
-        if not frames:
-            log.warning("⚠  All FBref fetches failed — advanced stats will be 0")
-            return pd.DataFrame()
-
-        merged = frames[0]
-        for frame in frames[1:]:
-            on = [c for c in ["player", "gw_raw"] if c in merged.columns and c in frame.columns]
-            merged = merged.merge(frame, on=on, how="outer")
-
-        # Parse "Matchweek 34" → 34
-        if "gw_raw" in merged.columns:
-            merged["GW"] = pd.to_numeric(
-                merged["gw_raw"].astype(str).str.extract(r"(\d+)")[0],
-                errors="coerce",
-            )
-
-        for stat in FBREF_STATS:
-            if stat not in merged.columns:
-                merged[stat] = 0.0
-
-        log.info(f"✓ FBref merged: {merged.shape[0]} player-GW rows")
-
-        try:
-            merged.to_parquet(cache_path)
-        except Exception:
-            pass  # pyarrow missing — just skip caching
-
-        return merged
-
-
-# ============================================================================
-# PLAYER NAME MATCHING
-# ============================================================================
-
-def fuzzy_match_names(fpl_names: list[str], fbref_names: list[str]) -> dict[str, str]:
-    """
-    Map FPL display names → FBref player names.
-    Strategy: exact → last-name-only → fuzzy (cutoff 0.76).
-    """
-    fb_lower = {n.lower(): n for n in fbref_names}
-    mapping: dict[str, str] = {}
-
-    for name in fpl_names:
-        low = name.lower()
-
-        # 1. Exact
-        if low in fb_lower:
-            mapping[name] = fb_lower[low]
-            continue
-
-        # 2. Last name only (unambiguous)
-        last = low.split()[-1]
-        hits = [orig for k, orig in fb_lower.items() if k.endswith(last)]
-        if len(hits) == 1:
-            mapping[name] = hits[0]
-            continue
-
-        # 3. Fuzzy
-        close = difflib.get_close_matches(low, list(fb_lower), n=1, cutoff=0.76)
-        if close:
-            mapping[name] = fb_lower[close[0]]
-
-    return mapping
 
 
 # ============================================================================
@@ -471,37 +263,10 @@ def enrich_with_fixture_context(df: pd.DataFrame, ts: pd.DataFrame,
 
 def load_current_season_data(
     fpl_client: FPLDataClient,
-    fbref_client: FBrefDataClient,
     boot: dict,
     fixtures: list,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    fpl_df   = load_fpl_data(fpl_client, boot)
-    fbref_df = fbref_client.load_match_stats()
-
-    if fbref_df.empty or "player" not in fbref_df.columns or "GW" not in fbref_df.columns:
-        log.warning("⚠  FBref data unavailable — advanced stats defaulted to 0")
-        for col in FBREF_STATS:
-            fpl_df[col] = 0.0
-        df = fpl_df
-    else:
-        name_map = fuzzy_match_names(
-            fpl_df["name"].unique().tolist(),
-            fbref_df["player"].unique().tolist(),
-        )
-        pct = 100 * len(name_map) / fpl_df["name"].nunique()
-        log.info(f"✓ Name match: {len(name_map)}/{fpl_df['name'].nunique()} ({pct:.0f}%)")
-        fpl_df["_fb"] = fpl_df["name"].map(name_map)
-        stat_cols  = [c for c in FBREF_STATS if c in fbref_df.columns]
-        fbref_slim = fbref_df[["player", "GW"] + stat_cols].rename(columns={"player": "_fb"})
-        df = fpl_df.merge(fbref_slim, on=["_fb", "GW"], how="left")
-        for col in FBREF_STATS:
-            if col not in df.columns:
-                df[col] = 0.0
-            else:
-                df[col] = df[col].fillna(0.0)
-        df.drop(columns=["_fb"], inplace=True)
-        log.info(f"✓ Merged dataset: {df.shape}")
-
+    df = load_fpl_data(fpl_client, boot)
     ts = build_team_gw_stats(df)
     df = enrich_with_fixture_context(df, ts, fixtures, boot)
     return df, ts
@@ -515,7 +280,7 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     """Lagged rolling averages for every stat — no future leakage."""
     df = df.sort_values(["name", "GW"]).reset_index(drop=True)
 
-    all_stats = FPL_ROLLING_STATS + FBREF_STATS
+    all_stats = FPL_ROLLING_STATS
 
     for window in [3, 5, 10]:
         for stat in all_stats:
@@ -577,14 +342,32 @@ def train_component_models(df: pd.DataFrame) -> tuple[dict, list]:
 
             X = sub[feature_cols].fillna(0)
 
-            tscv = TimeSeriesSplit(n_splits=2)
-            for tr, te in tscv.split(X):
-                m = LGBMRegressor(n_estimators=200, learning_rate=0.1, num_leaves=31,
-                                  verbose=-1, random_state=42)
-                m.fit(X.iloc[tr], y.iloc[tr])
+            # Use last time-series split to find best n_estimators via early stopping
+            tscv  = TimeSeriesSplit(n_splits=3)
+            tr, te = list(tscv.split(X))[-1]
 
-            m = LGBMRegressor(n_estimators=200, learning_rate=0.1, num_leaves=31,
-                              verbose=-1, random_state=42)
+            params = dict(
+                n_estimators=2000,
+                learning_rate=0.02,
+                num_leaves=31,
+                min_child_samples=20,
+                subsample=0.8,
+                colsample_bytree=0.7,
+                reg_alpha=0.1,
+                reg_lambda=0.5,
+                verbose=-1,
+                random_state=42,
+            )
+            m_cv = LGBMRegressor(**params)
+            m_cv.fit(
+                X.iloc[tr], y.iloc[tr],
+                eval_set=[(X.iloc[te], y.iloc[te])],
+                callbacks=[lgb_early_stopping(50, verbose=False)],
+            )
+            best_n = m_cv.best_iteration_ or 300
+
+            # Final model trained on all data with tuned n_estimators
+            m = LGBMRegressor(**{**params, "n_estimators": best_n})
             m.fit(X, y)
             bundle[pos][target] = m
 
@@ -653,30 +436,25 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
             for t in bundle[pos]
         }
 
-        exp_min = float(row.get("minutes_avg5", 60))
-        prob_cs = s.get("clean_sheets", 0) * min(1.0, exp_min / 60)
+        exp_min   = float(row.get("minutes_avg5", 60))
+        min_scale = min(1.0, exp_min / 90)  # scale per-event stats by expected minutes
+        prob_cs   = s.get("clean_sheets", 0) * min(1.0, exp_min / 60)
+
+        def sc(stat: str) -> float:
+            return s.get(stat, 0.0) * min_scale
 
         # Full Sleeper point formula — every scoring category
         pts = (
-            s.get("goals_scored",        0) * _pos_score("goals", pos)
-          + s.get("assists",             0) * _pos_score("assists", pos)
-          + s.get("shots_on_target",     0) * SLEEPER_SCORING["shots_on_target"]
-          + s.get("key_passes",          0) * _pos_score("key_passes", pos)
-          + s.get("successful_dribbles", 0) * SLEEPER_SCORING["successful_dribbles"]
-          + s.get("accurate_crosses",    0) * SLEEPER_SCORING["accurate_crosses"]
-          + s.get("yellow_cards",        0) * SLEEPER_SCORING["yellow_card"]
-          + s.get("red_cards",           0) * SLEEPER_SCORING["red_card"]
-          + s.get("aerials_won",         0) * _pos_score("aerials_won", pos)
-          + s.get("effective_clearances",0) * _pos_score("effective_clearances", pos)
-          + s.get("saves",               0) * SLEEPER_SCORING["saves"]
-          + prob_cs                         * _pos_score("clean_sheet_60plus", pos)
-          + s.get("tackles_won",         0) * SLEEPER_SCORING["tackles_won"]
-          + s.get("interceptions",       0) * SLEEPER_SCORING["interceptions"]
-          + s.get("blocked_shots",       0) * SLEEPER_SCORING["blocked_shots"]
-          + s.get("goals_conceded",      0) * _pos_score("goals_against", pos)
-          + s.get("own_goals",           0) * SLEEPER_SCORING["own_goals"]
-          + s.get("penalties_missed",    0) * SLEEPER_SCORING["penalties_missed"]
-          + s.get("penalties_saved",     0) * SLEEPER_SCORING["penalties_saved"]
+            sc("goals_scored")        * _pos_score("goals", pos)
+          + sc("assists")             * _pos_score("assists", pos)
+          + sc("saves")               * SLEEPER_SCORING["saves"]
+          + sc("goals_conceded")      * _pos_score("goals_against", pos)
+          + sc("own_goals")           * SLEEPER_SCORING["own_goals"]
+          + sc("penalties_missed")    * SLEEPER_SCORING["penalties_missed"]
+          + sc("penalties_saved")     * SLEEPER_SCORING["penalties_saved"]
+          + sc("yellow_cards")        * SLEEPER_SCORING["yellow_card"]
+          + sc("red_cards")           * SLEEPER_SCORING["red_card"]
+          + prob_cs                   * _pos_score("clean_sheet_60plus", pos)
         ) * avail_mult
 
         rows.append({
@@ -789,10 +567,9 @@ def main() -> None:
     log.info("=" * 50)
 
     fpl_client   = FPLDataClient()
-    fbref_client = FBrefDataClient()
     boot         = fpl_client.bootstrap()
     fixtures     = fpl_client.fixtures()
-    df, ts       = load_current_season_data(fpl_client, fbref_client, boot, fixtures)
+    df, ts       = load_current_season_data(fpl_client, boot, fixtures)
     feat         = engineer_features(df)
     bundle, feature_cols = train_component_models(feat)
     predictions  = predict_next_gw(feat, bundle, feature_cols, ts, fixtures, boot)
