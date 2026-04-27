@@ -61,6 +61,10 @@ SLEEPER_SCORING = {
     "interceptions":        1.0,
     "blocked_shots":        1.0,
     "goals_against":        {"FWD": 0,    "MID": 0,    "DEF": -2,   "GK": -2},
+    # FPL API available
+    "own_goals":            -5.0,
+    "penalties_missed":     -4.0,
+    "penalties_saved":       8.0,
 }
 
 # Stats that come exclusively from FBref (not in FPL API)
@@ -77,25 +81,14 @@ FBREF_STATS = [
 ]
 
 # FBref stat_type → {our_name: [candidate column substrings to search for]}
+# soccerdata FBref only supports 'summary' and 'keepers' for match-level stats
 FBREF_PULL = {
-    "shooting":   {
-        "shots_on_target":      ["sot", "shots_on_target"],
-    },
-    "passing":    {
-        "key_passes":           ["kp", "key_pass"],
-        "accurate_crosses":     ["crs", "crosses"],
-    },
-    "defense":    {
-        "tackles_won":          ["tklw", "tackles_won"],
-        "interceptions":        ["int", "interceptions"],
-        "blocked_shots":        ["blocks_sh", "sh"],   # shots blocked, under Blocks group
-        "effective_clearances": ["clr", "clearances"],
-    },
-    "possession": {
-        "successful_dribbles":  ["succ", "dribbles_succ", "successful_dribbles"],
-    },
-    "misc":       {
-        "aerials_won":          ["won", "aerials_won", "aerial_won"],
+    "summary": {
+        "shots_on_target": ["sot", "shots_on_target"],
+        "key_passes":      ["kp", "key_pass", "xag"],
+        "accurate_crosses":["crs", "crosses"],
+        "successful_dribbles": ["succ", "dribbles_succ"],
+        "aerials_won":     ["aerials_won", "aerial_won", "won"],
     },
 }
 
@@ -103,7 +96,7 @@ FBREF_PULL = {
 TRAIN_TARGETS = [
     "goals_scored", "assists", "expected_goals", "expected_assists",
     "clean_sheets", "saves", "yellow_cards", "red_cards",
-    "goals_conceded",
+    "goals_conceded", "own_goals", "penalties_missed", "penalties_saved",
     # FBref targets
     "shots_on_target", "key_passes", "accurate_crosses",
     "tackles_won", "interceptions", "blocked_shots",
@@ -117,6 +110,7 @@ FPL_ROLLING_STATS = [
     "goals_scored", "assists", "expected_goals", "expected_assists",
     "clean_sheets", "saves", "total_points", "influence", "creativity",
     "threat", "goals_conceded", "expected_goals_conceded",
+    "own_goals", "penalties_missed", "penalties_saved",
 ]
 
 
@@ -406,6 +400,9 @@ def load_fpl_data(client: FPLDataClient, boot: dict) -> pd.DataFrame:
                 "ict_index":        float(gw["ict_index"]),
                 "total_points":            gw["total_points"],
                 "expected_goals_conceded": float(gw.get("expected_goals_conceded", 0) or 0),
+                "own_goals":            gw.get("own_goals", 0),
+                "penalties_missed":     gw.get("penalties_missed", 0),
+                "penalties_saved":      gw.get("penalties_saved", 0),
                 "status":               av.get("status", "a"),
                 "chance_of_playing":    av.get("chance_of_playing_next_round") or 100,
             })
@@ -624,6 +621,7 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
         os   = latest_ts.loc[opp].to_dict() if opp in latest_ts.index else {}
         side = "away" if ih else "home"
         st   = str_df.get(opp, {})
+        base.at[idx, "opp"]          = opp or "TBC"
         base.at[idx, "was_home"]     = ih
         base.at[idx, "opp_gc_avg5"]  = os.get("team_goals_conceded_avg5", 1.2)
         base.at[idx, "opp_xgc_avg5"] = os.get("team_xg_conceded_avg5", 1.2)
@@ -676,11 +674,15 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
           + s.get("interceptions",       0) * SLEEPER_SCORING["interceptions"]
           + s.get("blocked_shots",       0) * SLEEPER_SCORING["blocked_shots"]
           + s.get("goals_conceded",      0) * _pos_score("goals_against", pos)
+          + s.get("own_goals",           0) * SLEEPER_SCORING["own_goals"]
+          + s.get("penalties_missed",    0) * SLEEPER_SCORING["penalties_missed"]
+          + s.get("penalties_saved",     0) * SLEEPER_SCORING["penalties_saved"]
         ) * avail_mult
 
         rows.append({
             "name":         row["name"],
             "team":         row["team"],
+            "opp":          row.get("opp", "TBC"),
             "position":     pos,
             "GW":           next_gw,
             "avail":        f"{int(chance)}%" if status != "a" else "OK",
@@ -705,8 +707,8 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
 # INTERACTIVE CLI
 # ============================================================================
 
-_DISPLAY_COLS = ["name", "team", "position", "avail", "exp_min",
-                 "exp_goals", "exp_assists", "exp_sot", "exp_tkl", "exp_int",
+_DISPLAY_COLS = ["name", "team", "opp", "position", "avail", "exp_min",
+                 "exp_goals", "exp_assists", "exp_sot", "exp_kp", "exp_tkl", "exp_int",
                  "exp_saves", "exp_cs", "sleeper_pts"]
 
 
