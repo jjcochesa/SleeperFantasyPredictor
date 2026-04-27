@@ -437,24 +437,51 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
         }
 
         exp_min   = float(row.get("minutes_avg5", 60))
-        min_scale = min(1.0, exp_min / 90)  # scale per-event stats by expected minutes
+        min_scale = min(1.0, exp_min / 90)
         prob_cs   = s.get("clean_sheets", 0) * min(1.0, exp_min / 60)
 
         def sc(stat: str) -> float:
             return s.get(stat, 0.0) * min_scale
 
-        # Full Sleeper point formula — every scoring category
+        # ICT-derived Opta stat estimates (FPL ICT is built from these underlying stats)
+        # threat ≈ 18pts per SoT | creativity ≈ 10pts per KP, 20 per cross, 12 per dribble
+        # influence ≈ 18pts per tackle, 22 per interception, 10 per clearance, 14 per aerial
+        thr = float(row.get("threat_avg5",     0))
+        cre = float(row.get("creativity_avg5", 0))
+        inf = float(row.get("influence_avg5",  0))
+
+        est_sot = thr / 18.0
+        est_kp  = cre / 10.0
+        est_crs = cre / 20.0
+        est_drb = cre / 12.0
+        est_tkl = inf / 18.0
+        est_int = inf / 22.0
+        est_blk = inf / 30.0
+        est_clr = inf / 10.0
+        est_aer = inf / 14.0
+
+        # Full Sleeper point formula
         pts = (
-            sc("goals_scored")        * _pos_score("goals", pos)
-          + sc("assists")             * _pos_score("assists", pos)
-          + sc("saves")               * SLEEPER_SCORING["saves"]
-          + sc("goals_conceded")      * _pos_score("goals_against", pos)
-          + sc("own_goals")           * SLEEPER_SCORING["own_goals"]
-          + sc("penalties_missed")    * SLEEPER_SCORING["penalties_missed"]
-          + sc("penalties_saved")     * SLEEPER_SCORING["penalties_saved"]
-          + sc("yellow_cards")        * SLEEPER_SCORING["yellow_card"]
-          + sc("red_cards")           * SLEEPER_SCORING["red_card"]
-          + prob_cs                   * _pos_score("clean_sheet_60plus", pos)
+            sc("goals_scored")     * _pos_score("goals", pos)
+          + sc("assists")          * _pos_score("assists", pos)
+          + sc("saves")            * SLEEPER_SCORING["saves"]
+          + sc("goals_conceded")   * _pos_score("goals_against", pos)
+          + sc("own_goals")        * SLEEPER_SCORING["own_goals"]
+          + sc("penalties_missed") * SLEEPER_SCORING["penalties_missed"]
+          + sc("penalties_saved")  * SLEEPER_SCORING["penalties_saved"]
+          + sc("yellow_cards")     * SLEEPER_SCORING["yellow_card"]
+          + sc("red_cards")        * SLEEPER_SCORING["red_card"]
+          + prob_cs                * _pos_score("clean_sheet_60plus", pos)
+          # ICT-derived
+          + est_sot * min_scale * SLEEPER_SCORING["shots_on_target"]
+          + est_kp  * min_scale * _pos_score("key_passes", pos)
+          + est_crs * min_scale * SLEEPER_SCORING["accurate_crosses"]
+          + est_drb * min_scale * SLEEPER_SCORING["successful_dribbles"]
+          + est_tkl * min_scale * SLEEPER_SCORING["tackles_won"]
+          + est_int * min_scale * SLEEPER_SCORING["interceptions"]
+          + est_blk * min_scale * SLEEPER_SCORING["blocked_shots"]
+          + est_clr * min_scale * _pos_score("effective_clearances", pos)
+          + est_aer * min_scale * _pos_score("aerials_won", pos)
         ) * avail_mult
 
         rows.append({
@@ -465,15 +492,15 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
             "GW":           next_gw,
             "avail":        f"{int(chance)}%" if status != "a" else "OK",
             "exp_min":      round(exp_min, 1),
-            "exp_goals":    round(s.get("goals_scored",        0), 2),
-            "exp_assists":  round(s.get("assists",             0), 2),
-            "exp_sot":      round(s.get("shots_on_target",     0), 2),
-            "exp_kp":       round(s.get("key_passes",          0), 2),
-            "exp_tkl":      round(s.get("tackles_won",         0), 2),
-            "exp_int":      round(s.get("interceptions",       0), 2),
-            "exp_saves":    round(s.get("saves",               0), 2),
-            "exp_cs":       round(prob_cs,                         2),
-            "sleeper_pts":  round(pts,                             2),
+            "exp_goals":    round(s.get("goals_scored", 0) * min_scale, 2),
+            "exp_assists":  round(s.get("assists",       0) * min_scale, 2),
+            "exp_sot":      round(est_sot * min_scale, 2),
+            "exp_kp":       round(est_kp  * min_scale, 2),
+            "exp_tkl":      round(est_tkl * min_scale, 2),
+            "exp_int":      round(est_int * min_scale, 2),
+            "exp_saves":    round(s.get("saves", 0) * min_scale, 2),
+            "exp_cs":       round(prob_cs,             2),
+            "sleeper_pts":  round(pts,                 2),
         })
 
     result = pd.DataFrame(rows).sort_values("sleeper_pts", ascending=False)
