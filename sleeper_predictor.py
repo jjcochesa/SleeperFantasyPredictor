@@ -66,8 +66,8 @@ TRAIN_TARGETS = [
     "goals_conceded", "own_goals", "penalties_missed", "penalties_saved",
 ]
 
-NON_FEATURE = {"name", "team", "position", "GW", "minutes", "player_id",
-               "status", "chance_of_playing"}
+NON_FEATURE = {"name", "display_name", "team", "position", "GW", "minutes",
+               "player_id", "status", "chance_of_playing", "price"}
 
 FPL_ROLLING_STATS = [
     "goals_scored", "assists", "expected_goals", "expected_assists",
@@ -171,6 +171,8 @@ def load_fpl_data(client: FPLDataClient, boot: dict) -> pd.DataFrame:
         for gw in summary.get("history", []):
             rows.append({
                 "name":             f"{el['first_name']} {el['second_name']}",
+                "display_name":     el.get("web_name", el["second_name"]),
+                "price":            round(el["now_cost"] / 10, 1),
                 "player_id":        pid,
                 "team":             team_map.get(el["team"], str(el["team"])),
                 "position":         POSITION_MAP.get(el["element_type"]),
@@ -443,22 +445,34 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
         def sc(stat: str) -> float:
             return s.get(stat, 0.0) * min_scale
 
-        # ICT-derived Opta stat estimates (FPL ICT is built from these underlying stats)
-        # threat ≈ 18pts per SoT | creativity ≈ 10pts per KP, 20 per cross, 12 per dribble
-        # influence ≈ 18pts per tackle, 22 per interception, 10 per clearance, 14 per aerial
+        # ICT-derived Opta stat estimates — position-specific conversion rates
+        # GK: influence = saves, not defensive actions → very low tackle/int divisors
+        # FWD: influence = shots/attacking, not defensive → suppress tkl/int/clr
         thr = float(row.get("threat_avg5",     0))
         cre = float(row.get("creativity_avg5", 0))
         inf = float(row.get("influence_avg5",  0))
 
-        est_sot = thr / 18.0
-        est_kp  = cre / 10.0
-        est_crs = cre / 20.0
-        est_drb = cre / 12.0
-        est_tkl = inf / 18.0
-        est_int = inf / 22.0
-        est_blk = inf / 30.0
-        est_clr = inf / 10.0
-        est_aer = inf / 14.0
+        if pos == "GK":
+            est_sot, est_kp, est_crs, est_drb = 0.0, 0.0, cre/50, 0.0
+            est_tkl, est_int, est_blk, est_clr, est_aer = inf/80, inf/90, 0.0, inf/12, inf/8
+        elif pos == "DEF":
+            est_sot, est_kp, est_crs, est_drb = thr/30, cre/25, cre/18, cre/22
+            est_tkl, est_int, est_blk, est_clr, est_aer = inf/18, inf/22, inf/28, inf/10, inf/12
+        elif pos == "MID":
+            est_sot, est_kp, est_crs, est_drb = thr/18, cre/22, cre/22, cre/25
+            est_tkl, est_int, est_blk, est_clr, est_aer = inf/25, inf/30, inf/30, inf/28, inf/18
+        else:  # FWD
+            est_sot, est_kp, est_crs, est_drb = thr/18, cre/28, cre/25, cre/20
+            est_tkl, est_int, est_blk, est_clr, est_aer = inf/55, inf/65, inf/55, 0.0, inf/14
+
+        # Form indicator: compare last-3 avg points vs last-10 avg
+        pts3  = float(row.get("total_points_avg3",  0))
+        pts10 = float(row.get("total_points_avg10", 0))
+        if pts10 > 0.5:
+            ratio = pts3 / pts10
+            form  = "🔥" if ratio >= 1.3 else ("❄️" if ratio <= 0.7 else "~")
+        else:
+            form = "~"
 
         # Full Sleeper point formula
         pts = (
@@ -486,11 +500,14 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
 
         rows.append({
             "name":         row["name"],
+            "display_name": row.get("display_name", row["name"]),
             "team":         row["team"],
             "opp":          row.get("opp", "TBC"),
             "position":     pos,
+            "form":         form,
             "GW":           next_gw,
             "avail":        f"{int(chance)}%" if status != "a" else "OK",
+            "price":        round(float(row.get("price", 0)), 1),
             "exp_min":      round(exp_min, 1),
             "exp_goals":    round(s.get("goals_scored", 0) * min_scale, 2),
             "exp_assists":  round(s.get("assists",       0) * min_scale, 2),
@@ -512,7 +529,7 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
 # INTERACTIVE CLI
 # ============================================================================
 
-_DISPLAY_COLS = ["name", "team", "opp", "position", "avail", "exp_min",
+_DISPLAY_COLS = ["display_name", "team", "opp", "position", "form", "avail", "price",
                  "exp_goals", "exp_assists", "exp_sot", "exp_kp", "exp_tkl", "exp_int",
                  "exp_saves", "exp_cs", "sleeper_pts"]
 
