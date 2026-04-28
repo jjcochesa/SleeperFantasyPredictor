@@ -526,7 +526,121 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
 
     result = pd.DataFrame(rows).sort_values("sleeper_pts", ascending=False)
     log.info(f"✓ Predicted {len(result)} players for GW{next_gw}")
+
+    # Auto-save for later validation once GW completes
+    save_path = Path(".fpl_cache") / f"predictions_gw{next_gw}.csv"
+    try:
+        result.to_csv(save_path, index=False)
+        log.info(f"💾 Predictions saved → {save_path.name}")
+    except Exception:
+        pass
+
     return result
+
+
+# ============================================================================
+# GW VALIDATION
+# ============================================================================
+
+def _score_actual_gw(row: pd.Series, pos: str) -> float:
+    """Approximate actual Sleeper pts from a completed GW row using real stats."""
+    if float(row.get("minutes", 0)) == 0:
+        return 0.0
+    minutes = float(row.get("minutes", 0))
+    cs = float(row.get("clean_sheets", 0)) if minutes >= 60 else 0.0
+
+    thr = float(row.get("threat", 0))
+    cre = float(row.get("creativity", 0))
+    inf = float(row.get("influence", 0))
+
+    if pos == "GK":
+        est_sot, est_kp, est_crs, est_drb = 0.0, 0.0, cre/50, 0.0
+        est_tkl, est_int, est_blk, est_clr, est_aer = inf/80, inf/90, 0.0, inf/12, inf/8
+    elif pos == "DEF":
+        est_sot, est_kp, est_crs, est_drb = thr/30, cre/25, cre/18, cre/22
+        est_tkl, est_int, est_blk, est_clr, est_aer = inf/18, inf/22, inf/28, inf/10, inf/12
+    elif pos == "MID":
+        est_sot, est_kp, est_crs, est_drb = thr/18, cre/22, cre/22, cre/25
+        est_tkl, est_int, est_blk, est_clr, est_aer = inf/25, inf/30, inf/30, inf/28, inf/18
+    else:
+        est_sot, est_kp, est_crs, est_drb = thr/18, cre/28, cre/25, cre/20
+        est_tkl, est_int, est_blk, est_clr, est_aer = inf/55, inf/65, inf/55, 0.0, inf/14
+
+    return (
+        float(row.get("goals_scored",    0)) * _pos_score("goals", pos)
+      + float(row.get("assists",         0)) * _pos_score("assists", pos)
+      + float(row.get("saves",           0)) * SLEEPER_SCORING["saves"]
+      + float(row.get("goals_conceded",  0)) * _pos_score("goals_against", pos)
+      + float(row.get("own_goals",       0)) * SLEEPER_SCORING["own_goals"]
+      + float(row.get("penalties_missed",0)) * SLEEPER_SCORING["penalties_missed"]
+      + float(row.get("penalties_saved", 0)) * SLEEPER_SCORING["penalties_saved"]
+      + float(row.get("yellow_cards",    0)) * SLEEPER_SCORING["yellow_card"]
+      + float(row.get("red_cards",       0)) * SLEEPER_SCORING["red_card"]
+      + cs                                    * _pos_score("clean_sheet_60plus", pos)
+      + est_sot * SLEEPER_SCORING["shots_on_target"]
+      + est_kp  * _pos_score("key_passes", pos)
+      + est_crs * SLEEPER_SCORING["accurate_crosses"]
+      + est_drb * SLEEPER_SCORING["successful_dribbles"]
+      + est_tkl * SLEEPER_SCORING["tackles_won"]
+      + est_int * SLEEPER_SCORING["interceptions"]
+      + est_blk * SLEEPER_SCORING["blocked_shots"]
+      + est_clr * _pos_score("effective_clearances", pos)
+      + est_aer * _pos_score("aerials_won", pos)
+    )
+
+
+def validate_last_gw(df: pd.DataFrame) -> None:
+    """Compare the most recent saved predictions against actual completed GW results."""
+    cache_dir = Path(".fpl_cache")
+    pred_files = sorted(cache_dir.glob("predictions_gw*.csv"))
+    if not pred_files:
+        print("  No saved predictions yet — run before a gameweek to start tracking.")
+        return
+
+    completed_gws = set(df["GW"].unique())
+    valid_file = pred_gw = None
+    for f in reversed(pred_files):
+        try:
+            gw = int(f.stem.replace("predictions_gw", ""))
+            if gw in completed_gws:
+                valid_file, pred_gw = f, gw
+                break
+        except ValueError:
+            continue
+
+    if valid_file is None:
+        next_gw = int(df["GW"].max()) + 1
+        print(f"  GW{next_gw} predictions saved — check back after the gameweek completes.")
+        return
+
+    saved  = pd.read_csv(valid_file)
+    gw_df  = df[df["GW"] == pred_gw].copy()
+    gw_df["actual_pts"] = gw_df.apply(lambda r: _score_actual_gw(r, r["position"]), axis=1)
+
+    actual = gw_df[["name", "actual_pts"]].set_index("name")
+    merged = (
+        saved.set_index("name")[["display_name", "position", "sleeper_pts"]]
+        .join(actual, how="inner")
+        .reset_index()
+        .rename(columns={"sleeper_pts": "pred_pts"})
+    )
+    merged["error"]     = merged["actual_pts"] - merged["pred_pts"]
+    merged["abs_error"] = merged["error"].abs()
+
+    mae      = merged["abs_error"].mean()
+    corr     = merged[["pred_pts", "actual_pts"]].corr().iloc[0, 1]
+    top10    = set(merged.nlargest(10, "pred_pts")["name"])
+    top20act = set(merged.nlargest(20, "actual_pts")["name"])
+    hit_rate = len(top10 & top20act)
+
+    print(f"\n📊  GW{pred_gw} ACCURACY CHECK\n")
+    print(f"  MAE:         {mae:.2f} pts  |  Correlation: {corr:.2f}  |  Top-10 hit: {hit_rate}/10 in actual top 20\n")
+
+    display = merged.nlargest(20, "pred_pts")[
+        ["display_name", "position", "pred_pts", "actual_pts", "error"]
+    ].copy()
+    display["error"] = display["error"].map(lambda x: f"+{x:.1f}" if x >= 0 else f"{x:.1f}")
+    print(display.to_string(index=False))
 
 
 # ============================================================================
@@ -538,7 +652,7 @@ _DISPLAY_COLS = ["display_name", "team", "opp", "ha", "fdr", "position", "form",
                  "exp_saves", "exp_cs", "sleeper_pts"]
 
 
-def print_menu(predictions: pd.DataFrame) -> None:
+def print_menu(predictions: pd.DataFrame, df: pd.DataFrame) -> None:
     while True:
         print("\n" + "=" * 90)
         print(f"⚽  SLEEPER FANTASY  GW{predictions['GW'].iloc[0]}  PREDICTOR")
@@ -551,9 +665,10 @@ def print_menu(predictions: pd.DataFrame) -> None:
         print("  [5] Show stat breakdown for a player")
         print("  [6] Export to CSV")
         print("  [7] Exit")
+        print("  [8] Validate last GW accuracy")
         print()
 
-        choice = input("Choose (1-7): ").strip()
+        choice = input("Choose (1-8): ").strip()
 
         if choice == "1":
             print("\n🏆 TOP 50 SLEEPER SCORERS\n")
@@ -605,6 +720,9 @@ def print_menu(predictions: pd.DataFrame) -> None:
             print("\nGoodbye! ⚽")
             break
 
+        elif choice == "8":
+            validate_last_gw(df)
+
 
 # ============================================================================
 # MAIN
@@ -621,7 +739,7 @@ def main() -> None:
     feat         = engineer_features(df)
     bundle, feature_cols = train_component_models(feat)
     predictions  = predict_next_gw(feat, bundle, feature_cols, ts, fixtures, boot)
-    print_menu(predictions)
+    print_menu(predictions, feat)
 
 
 if __name__ == "__main__":
