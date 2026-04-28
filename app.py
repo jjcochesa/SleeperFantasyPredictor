@@ -54,57 +54,35 @@ _COL_CONFIG = {
 # ── Sleeper roster fetch ──────────────────────────────────────────────────────
 
 @st.cache_data(ttl=300, show_spinner=False)
-def get_drafted_names(league_id: str) -> set[str]:
-    """Return a set of lowercase player names already on a roster in the league."""
+def get_league_data(league_id: str) -> tuple[set[str], str]:
+    """
+    Returns (set_of_drafted_player_ids, status_message).
+    Uses FPL player IDs directly since Sleeper FPL leagues use them as player keys.
+    """
     try:
-        # All rosters in the league
-        rosters_r = requests.get(f"{SLEEPER_API}/league/{league_id}/rosters", timeout=10)
-        rosters_r.raise_for_status()
-        rosters = rosters_r.json()
+        r = requests.get(f"{SLEEPER_API}/league/{league_id}/rosters", timeout=15)
+        r.raise_for_status()
+        rosters = r.json()
 
-        # Collect all player IDs across every roster
-        player_ids: list[str] = []
+        if not rosters:
+            return set(), "No rosters found in league"
+
+        # Collect all player IDs (Sleeper FPL leagues use FPL element IDs as strings)
+        player_ids: set[str] = set()
         for roster in rosters:
-            player_ids.extend(roster.get("players") or [])
-            player_ids.extend(roster.get("reserve") or [])
-            player_ids.extend(roster.get("taxi") or [])
+            for field in ("players", "reserve", "taxi"):
+                for pid in (roster.get(field) or []):
+                    player_ids.add(str(pid))
 
         if not player_ids:
-            return set()
+            return set(), "Rosters exist but no players found yet"
 
-        # Sleeper soccer player database — maps id → {full_name, ...}
-        players_r = requests.get(f"{SLEEPER_API}/players/epl", timeout=30)
-        if players_r.status_code != 200:
-            # Fallback sport key
-            players_r = requests.get(f"{SLEEPER_API}/players/soccer", timeout=30)
-        players_r.raise_for_status()
-        all_players: dict = players_r.json()
+        return player_ids, f"✅ League synced — {len(player_ids)} players on rosters"
 
-        drafted: set[str] = set()
-        for pid in player_ids:
-            p = all_players.get(str(pid), {})
-            full = p.get("full_name") or f"{p.get('first_name','')} {p.get('last_name','')}".strip()
-            if full:
-                drafted.add(full.lower())
-
-        return drafted
-
-    except Exception:
-        return set()
-
-
-def _is_available(name: str, drafted: set[str]) -> bool:
-    if not drafted:
-        return True
-    n = name.lower()
-    # Exact match or partial — Sleeper names may differ slightly from FPL
-    if n in drafted:
-        return False
-    parts = n.split()
-    return not any(
-        all(p in d for p in parts) or all(p in parts for p in d.split())
-        for d in drafted
-    )
+    except requests.HTTPError as e:
+        return set(), f"Sleeper API error: {e.response.status_code}"
+    except Exception as e:
+        return set(), f"Could not reach Sleeper: {e}"
 
 
 # ── FPL predictions ───────────────────────────────────────────────────────────
@@ -146,17 +124,17 @@ with c3:
 with c4:
     search = st.text_input("Search player", placeholder="e.g. Salah, Haaland")
 
-# Draft availability toggle
-with st.spinner("Checking your league roster..."):
-    drafted = get_drafted_names(SLEEPER_LEAGUE_ID)
+# Sleeper league sync
+drafted_ids, league_status = get_league_data(SLEEPER_LEAGUE_ID)
+league_ok = bool(drafted_ids)
 
-league_ok = bool(drafted)  # False means API didn't return data
+st.caption(league_status)
+
 available_only = st.toggle(
     "✅ Show available (undrafted) players only",
     value=False,
-    help="Hides players already on a roster in your Sleeper league" if league_ok
-         else "League roster data unavailable — toggle has no effect",
     disabled=not league_ok,
+    help="Hides players already on a roster in your Sleeper league",
 )
 
 # Apply filters
@@ -174,9 +152,10 @@ if search:
     )
     view = view[mask]
 if available_only and league_ok:
-    view = view[view["name"].apply(lambda n: _is_available(n, drafted))]
+    # player_id in predictions is the FPL element ID — same key Sleeper uses
+    view = view[~view["player_id"].astype(str).isin(drafted_ids)]
 
-st.caption(f"{len(view)} players" + (" · league data live" if league_ok else " · league data unavailable"))
+st.caption(f"{len(view)} players shown")
 
 st.dataframe(
     view[_DISPLAY_COLS].head(100),
