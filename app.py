@@ -146,19 +146,27 @@ def _is_drafted(fpl_name: str, display_name: str, drafted_names: set[str]) -> bo
     n = _normalise(fpl_name)      # e.g. "emiliano martinez romero"
     d = _normalise(display_name)  # e.g. "martinez"
 
-    # Exact full-name or display-name match
-    if n in drafted_names or d in drafted_names:
+    # 1. Exact full-name match
+    if n in drafted_names:
         return True
 
-    # Display name as substring (catches "Raya"→"david raya", "Martinez"→"emi martinez")
-    if len(d) >= 4 and any(d in dn for dn in drafted_names):
+    # 2. Exact display-name match
+    if d in drafted_names:
         return True
 
-    # Check last two significant words of full name (handles multi-part surnames)
-    words = [w for w in n.split() if len(w) >= 4]
+    # 3. Display name is an exact word in a Sleeper name (word-level, not substring)
+    #    "raya" → "david raya".split() ✓   "son" → "mason mount".split() ✗
+    if len(d) >= 4:
+        for dn in drafted_names:
+            if d in dn.split():
+                return True
+
+    # 4. Last 1-2 significant words (≥5 chars) of FPL full name match exactly
+    words = [w for w in n.split() if len(w) >= 5]
     for word in words[-2:]:
-        if any(word in dn for dn in drafted_names):
-            return True
+        for dn in drafted_names:
+            if word in dn.split():
+                return True
 
     return False
 
