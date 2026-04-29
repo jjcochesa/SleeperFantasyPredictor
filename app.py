@@ -152,10 +152,17 @@ if search:
     )
     view = view[mask]
 if available_only and league_ok:
-    # player_id in predictions is the FPL element ID — same key Sleeper uses
     view = view[~view["player_id"].astype(str).isin(drafted_ids)]
 
 st.caption(f"{len(view)} players shown")
+
+with st.expander("🔍 Debug: ID matching", expanded=False):
+    sample_sleeper = sorted(drafted_ids)[:10]
+    sample_fpl    = predictions["player_id"].astype(str).head(10).tolist()
+    st.write("**Sleeper roster IDs (first 10):**", sample_sleeper)
+    st.write("**FPL player IDs in predictions (first 10):**", sample_fpl)
+    overlap = drafted_ids & set(predictions["player_id"].astype(str))
+    st.write(f"**Matching IDs:** {len(overlap)} overlap out of {len(drafted_ids)} drafted")
 
 st.dataframe(
     view[_DISPLAY_COLS].head(100),
