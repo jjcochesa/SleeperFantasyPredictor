@@ -53,12 +53,35 @@ _COL_CONFIG = {
 
 # ── Sleeper roster fetch ──────────────────────────────────────────────────────
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_sleeper_name_map() -> dict[str, str]:
+    """Fetch Sleeper's player database and return {sleeper_id: full_name}."""
+    for sport in ("epl", "soccer", "pl"):
+        try:
+            r = requests.get(f"{SLEEPER_API}/players/{sport}", timeout=30)
+            if r.status_code == 200:
+                data = r.json()
+                result = {}
+                for pid, p in data.items():
+                    full = (p.get("full_name")
+                            or f"{p.get('first_name', '')} {p.get('last_name', '')}".strip())
+                    if full.strip():
+                        result[str(pid)] = full.strip()
+                if result:
+                    return result
+        except Exception:
+            continue
+    return {}
+
+
+def _normalise(name: str) -> str:
+    """Lowercase, strip accents loosely for matching."""
+    return name.lower().strip()
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def get_league_data(league_id: str) -> tuple[set[str], str]:
-    """
-    Returns (set_of_drafted_player_ids, status_message).
-    Uses FPL player IDs directly since Sleeper FPL leagues use them as player keys.
-    """
+    """Returns (set_of_drafted_lowercase_names, status_message)."""
     try:
         r = requests.get(f"{SLEEPER_API}/league/{league_id}/rosters", timeout=15)
         r.raise_for_status()
@@ -67,7 +90,6 @@ def get_league_data(league_id: str) -> tuple[set[str], str]:
         if not rosters:
             return set(), "No rosters found in league"
 
-        # Collect all player IDs (Sleeper FPL leagues use FPL element IDs as strings)
         player_ids: set[str] = set()
         for roster in rosters:
             for field in ("players", "reserve", "taxi"):
@@ -77,12 +99,37 @@ def get_league_data(league_id: str) -> tuple[set[str], str]:
         if not player_ids:
             return set(), "Rosters exist but no players found yet"
 
-        return player_ids, f"✅ League synced — {len(player_ids)} players on rosters"
+        # Map Sleeper IDs → names
+        name_map = get_sleeper_name_map()
+        drafted_names: set[str] = set()
+        for pid in player_ids:
+            name = name_map.get(pid, "")
+            if name:
+                drafted_names.add(_normalise(name))
+
+        if drafted_names:
+            return drafted_names, f"✅ League synced — {len(player_ids)} players on rosters"
+
+        # name map unavailable — return raw IDs so at least status shows
+        return player_ids, f"⚠️ League synced ({len(player_ids)} players) but name lookup failed"
 
     except requests.HTTPError as e:
         return set(), f"Sleeper API error: {e.response.status_code}"
     except Exception as e:
         return set(), f"Could not reach Sleeper: {e}"
+
+
+def _is_drafted(fpl_name: str, display_name: str, drafted_names: set[str]) -> bool:
+    """Return True if this player appears in the drafted set."""
+    n = _normalise(fpl_name)
+    d = _normalise(display_name)
+    if n in drafted_names or d in drafted_names:
+        return True
+    # last-name fallback for short display names like "B.Fernandes"
+    last = n.split()[-1] if n else ""
+    if len(last) > 4:
+        return any(last in dn for dn in drafted_names)
+    return False
 
 
 # ── FPL predictions ───────────────────────────────────────────────────────────
@@ -152,17 +199,19 @@ if search:
     )
     view = view[mask]
 if available_only and league_ok:
-    view = view[~view["player_id"].astype(str).isin(drafted_ids)]
+    view = view[~view.apply(
+        lambda r: _is_drafted(r["name"], r["display_name"], drafted_ids), axis=1
+    )]
 
 st.caption(f"{len(view)} players shown")
 
-with st.expander("🔍 Debug: ID matching", expanded=False):
-    sample_sleeper = sorted(drafted_ids)[:10]
-    sample_fpl    = predictions["player_id"].astype(str).head(10).tolist()
-    st.write("**Sleeper roster IDs (first 10):**", sample_sleeper)
-    st.write("**FPL player IDs in predictions (first 10):**", sample_fpl)
-    overlap = drafted_ids & set(predictions["player_id"].astype(str))
-    st.write(f"**Matching IDs:** {len(overlap)} overlap out of {len(drafted_ids)} drafted")
+with st.expander("🔍 Debug: name matching", expanded=False):
+    sample_drafted = sorted(drafted_ids)[:10]
+    sample_fpl     = predictions[["name", "display_name"]].head(10).values.tolist()
+    st.write("**Drafted names from Sleeper (first 10):**", sample_drafted)
+    st.write("**FPL names in predictions (first 10):**", sample_fpl)
+    if available_only:
+        st.write(f"**Players filtered out:** {len(predictions) - len(view)}")
 
 st.dataframe(
     view[_DISPLAY_COLS].head(100),
