@@ -143,30 +143,26 @@ def get_league_data(league_id: str) -> tuple[set[str], str]:
 
 def _is_drafted(fpl_name: str, display_name: str, drafted_names: set[str]) -> bool:
     """Return True if this player appears in the drafted set."""
-    n = _normalise(fpl_name)      # e.g. "emiliano martinez romero"
-    d = _normalise(display_name)  # e.g. "martinez"
+    n = _normalise(fpl_name)
+    d = _normalise(display_name)
 
-    # 1. Exact full-name match
-    if n in drafted_names:
+    # 1. Exact full-name or display-name match
+    if n in drafted_names or d in drafted_names:
         return True
 
-    # 2. Exact display-name match
-    if d in drafted_names:
-        return True
+    n_words = set(n.split())
+    for dn in drafted_names:
+        dn_words = dn.split()
+        dn_set   = set(dn_words)
 
-    # 3. Display name is an exact word in a Sleeper name (word-level, not substring)
-    #    "raya" → "david raya".split() ✓   "son" → "mason mount".split() ✗
-    if len(d) >= 4:
-        for dn in drafted_names:
-            if d in dn.split():
-                return True
+        # 2. Two or more words in common — catches "Bruno Borges Fernandes" vs "Bruno Fernandes"
+        if len(n_words & dn_set) >= 2:
+            return True
 
-    # 4. Last 1-2 significant words (≥5 chars) of FPL full name match exactly
-    words = [w for w in n.split() if len(w) >= 5]
-    for word in words[-2:]:
-        for dn in drafted_names:
-            if word in dn.split():
-                return True
+        # 3. Display name (≥5 chars) is the last word of a Sleeper name
+        #    — catches "Martinez" → "emi martinez", "Stach" → "anton stach"
+        if len(d) >= 5 and d == dn_words[-1]:
+            return True
 
     return False
 
