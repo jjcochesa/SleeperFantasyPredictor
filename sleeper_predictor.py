@@ -504,6 +504,7 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
         rows.append({
             "name":         row["name"],
             "display_name": row.get("display_name", row["name"]),
+            "player_id":    row.get("player_id", ""),
             "team":         row["team"],
             "opp":          row.get("opp", "TBC"),
             "ha":           row.get("ha", "?"),
