@@ -443,14 +443,11 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
 
         exp_min   = float(row.get("minutes_avg5", 60))
         min_scale = min(1.0, exp_min / 90)
-        prob_cs   = s.get("clean_sheets", 0) * min(1.0, exp_min / 60)
 
         def sc(stat: str) -> float:
             return s.get(stat, 0.0) * min_scale
 
         # ICT-derived Opta stat estimates — position-specific conversion rates
-        # GK: influence = saves, not defensive actions → very low tackle/int divisors
-        # FWD: influence = shots/attacking, not defensive → suppress tkl/int/clr
         thr = float(row.get("threat_avg5",     0))
         cre = float(row.get("creativity_avg5", 0))
         inf = float(row.get("influence_avg5",  0))
@@ -468,6 +465,42 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
             est_sot, est_kp, est_crs, est_drb = thr/18, cre/28, cre/25, cre/20
             est_tkl, est_int, est_blk, est_clr, est_aer = inf/55, inf/65, inf/55, 0.0, inf/14
 
+        # ── Fixture-difficulty + opponent-quality adjustments ─────────────────
+        fdr    = int(row.get("fdr", 3))
+        opp_gs = max(0.3, float(row.get("opp_gs_avg5", 1.3)))  # opp avg goals scored
+        opp_gc = max(0.3, float(row.get("opp_gc_avg5", 1.3)))  # opp avg goals conceded
+
+        # Attacking mult: easy fixture + weak defence = more output
+        fdr_att = {1: 1.6, 2: 1.3, 3: 1.0, 4: 0.72, 5: 0.48}[fdr]
+        opp_def_factor = min(1.6, max(0.5, opp_gc / 1.3))
+        att_mult = fdr_att * opp_def_factor
+
+        # Defensive mult: hard fixture = more defensive actions
+        fdr_def = {1: 0.65, 2: 0.82, 3: 1.0, 4: 1.25, 5: 1.55}[fdr]
+
+        # Physical maxima by position — prevents model artifacts
+        GOAL_CAPS   = {"GK": 0.03, "DEF": 0.12, "MID": 0.40, "FWD": 0.80}
+        ASSIST_CAPS = {"GK": 0.02, "DEF": 0.25, "MID": 0.50, "FWD": 0.35}
+
+        adj_goals   = min(s.get("goals_scored", 0) * att_mult * min_scale,
+                          GOAL_CAPS[pos]   * min_scale)
+        adj_assists = min(s.get("assists",       0) * att_mult * min_scale,
+                          ASSIST_CAPS[pos] * min_scale)
+        adj_saves   = s.get("saves",          0) * fdr_def * min_scale
+        adj_gc      = s.get("goals_conceded", 0) * fdr_def * min_scale
+
+        # Poisson clean sheet: P(CS) = e^(-λ), λ = expected opp goals this GW
+        lambda_opp = opp_gs * fdr_def
+        prob_cs    = float(np.exp(-lambda_opp)) if exp_min >= 60 else 0.0
+        prob_cs    = min(0.85, prob_cs)
+
+        # Apply FDR to ICT-derived stats
+        est_sot *= att_mult;  est_kp  *= att_mult
+        est_crs *= att_mult;  est_drb *= att_mult
+        est_tkl *= fdr_def;   est_int *= fdr_def
+        est_blk *= fdr_def;   est_clr *= fdr_def
+        # est_aer unchanged — aerial duel rate is roughly fixture-independent
+
         # Form indicator: compare last-3 avg points vs last-10 avg
         pts3  = float(row.get("total_points_avg3",  0))
         pts10 = float(row.get("total_points_avg10", 0))
@@ -479,17 +512,17 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
 
         # Full Sleeper point formula
         pts = (
-            sc("goals_scored")     * _pos_score("goals", pos)
-          + sc("assists")          * _pos_score("assists", pos)
-          + sc("saves")            * SLEEPER_SCORING["saves"]
-          + sc("goals_conceded")   * _pos_score("goals_against", pos)
-          + sc("own_goals")        * SLEEPER_SCORING["own_goals"]
-          + sc("penalties_missed") * SLEEPER_SCORING["penalties_missed"]
-          + sc("penalties_saved")  * SLEEPER_SCORING["penalties_saved"]
-          + sc("yellow_cards")     * SLEEPER_SCORING["yellow_card"]
-          + sc("red_cards")        * SLEEPER_SCORING["red_card"]
-          + prob_cs                * _pos_score("clean_sheet_60plus", pos)
-          # ICT-derived
+            adj_goals                * _pos_score("goals", pos)
+          + adj_assists              * _pos_score("assists", pos)
+          + adj_saves                * SLEEPER_SCORING["saves"]
+          + adj_gc                   * _pos_score("goals_against", pos)
+          + sc("own_goals")          * SLEEPER_SCORING["own_goals"]
+          + sc("penalties_missed")   * SLEEPER_SCORING["penalties_missed"]
+          + sc("penalties_saved")    * SLEEPER_SCORING["penalties_saved"]
+          + sc("yellow_cards")       * SLEEPER_SCORING["yellow_card"]
+          + sc("red_cards")          * SLEEPER_SCORING["red_card"]
+          + prob_cs                  * _pos_score("clean_sheet_60plus", pos)
+          # ICT-derived (FDR already applied to est_ values above)
           + est_sot * min_scale * SLEEPER_SCORING["shots_on_target"]
           + est_kp  * min_scale * _pos_score("key_passes", pos)
           + est_crs * min_scale * SLEEPER_SCORING["accurate_crosses"]
@@ -514,15 +547,15 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
             "GW":           next_gw,
             "avail":        f"{int(chance)}%" if status != "a" else "OK",
             "exp_min":      round(exp_min, 1),
-            "exp_goals":    round(s.get("goals_scored", 0) * min_scale, 2),
-            "exp_assists":  round(s.get("assists",       0) * min_scale, 2),
+            "exp_goals":    round(adj_goals,   2),
+            "exp_assists":  round(adj_assists, 2),
             "exp_sot":      round(est_sot * min_scale, 2),
             "exp_kp":       round(est_kp  * min_scale, 2),
             "exp_tkl":      round(est_tkl * min_scale, 2),
             "exp_int":      round(est_int * min_scale, 2),
-            "exp_saves":    round(s.get("saves", 0) * min_scale, 2),
-            "exp_cs":       round(prob_cs,             2),
-            "sleeper_pts":  round(pts,                 2),
+            "exp_saves":    round(adj_saves,   2),
+            "exp_cs":       round(prob_cs,     2),
+            "sleeper_pts":  round(pts,         2),
         })
 
     result = pd.DataFrame(rows).sort_values("sleeper_pts", ascending=False)
