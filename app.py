@@ -2,6 +2,7 @@
 Sleeper Fantasy FPL Predictor — Streamlit Web App
 """
 
+import unicodedata
 import streamlit as st
 import pandas as pd
 import requests
@@ -93,8 +94,9 @@ def get_sleeper_name_map() -> tuple[dict[str, str], list[str]]:
 
 
 def _normalise(name: str) -> str:
-    """Lowercase, strip accents loosely for matching."""
-    return name.lower().strip()
+    """Lowercase and strip accents."""
+    nfkd = unicodedata.normalize("NFKD", name.lower().strip())
+    return "".join(c for c in nfkd if not unicodedata.combining(c))
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -141,14 +143,23 @@ def get_league_data(league_id: str) -> tuple[set[str], str]:
 
 def _is_drafted(fpl_name: str, display_name: str, drafted_names: set[str]) -> bool:
     """Return True if this player appears in the drafted set."""
-    n = _normalise(fpl_name)
-    d = _normalise(display_name)
+    n = _normalise(fpl_name)      # e.g. "emiliano martinez romero"
+    d = _normalise(display_name)  # e.g. "martinez"
+
+    # Exact full-name or display-name match
     if n in drafted_names or d in drafted_names:
         return True
-    # last-name fallback for short display names like "B.Fernandes"
-    last = n.split()[-1] if n else ""
-    if len(last) > 4:
-        return any(last in dn for dn in drafted_names)
+
+    # Display name as substring (catches "Raya"→"david raya", "Martinez"→"emi martinez")
+    if len(d) >= 4 and any(d in dn for dn in drafted_names):
+        return True
+
+    # Check last two significant words of full name (handles multi-part surnames)
+    words = [w for w in n.split() if len(w) >= 4]
+    for word in words[-2:]:
+        if any(word in dn for dn in drafted_names):
+            return True
+
     return False
 
 
