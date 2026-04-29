@@ -54,11 +54,27 @@ _COL_CONFIG = {
 # ── Sleeper roster fetch ──────────────────────────────────────────────────────
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_sleeper_name_map() -> dict[str, str]:
-    """Fetch Sleeper's player database and return {sleeper_id: full_name}."""
-    for sport in ("epl", "soccer", "pl"):
+def get_sleeper_name_map() -> tuple[dict[str, str], list[str]]:
+    """Fetch Sleeper's player database. Returns ({id: name}, [debug_lines])."""
+    debug = []
+    # First, get the league info to find the correct sport key
+    try:
+        lr = requests.get(f"{SLEEPER_API}/league/{SLEEPER_LEAGUE_ID}", timeout=10)
+        sport_key = lr.json().get("sport", "") if lr.status_code == 200 else ""
+        debug.append(f"League sport key: '{sport_key}' (status {lr.status_code})")
+    except Exception as e:
+        sport_key = ""
+        debug.append(f"League fetch error: {e}")
+
+    sport_keys = []
+    if sport_key:
+        sport_keys.append(sport_key)
+    sport_keys += [k for k in ("epl", "soccer", "pl", "football", "nfl") if k != sport_key]
+
+    for sport in sport_keys:
         try:
             r = requests.get(f"{SLEEPER_API}/players/{sport}", timeout=30)
+            debug.append(f"  /players/{sport} → {r.status_code}")
             if r.status_code == 200:
                 data = r.json()
                 result = {}
@@ -68,10 +84,12 @@ def get_sleeper_name_map() -> dict[str, str]:
                     if full.strip():
                         result[str(pid)] = full.strip()
                 if result:
-                    return result
-        except Exception:
-            continue
-    return {}
+                    debug.append(f"  ✅ Got {len(result)} players from /players/{sport}")
+                    return result, debug
+        except Exception as e:
+            debug.append(f"  /players/{sport} → error: {e}")
+
+    return {}, debug
 
 
 def _normalise(name: str) -> str:
@@ -100,7 +118,7 @@ def get_league_data(league_id: str) -> tuple[set[str], str]:
             return set(), "Rosters exist but no players found yet"
 
         # Map Sleeper IDs → names
-        name_map = get_sleeper_name_map()
+        name_map, name_debug = get_sleeper_name_map()
         drafted_names: set[str] = set()
         for pid in player_ids:
             name = name_map.get(pid, "")
@@ -110,8 +128,10 @@ def get_league_data(league_id: str) -> tuple[set[str], str]:
         if drafted_names:
             return drafted_names, f"✅ League synced — {len(player_ids)} players on rosters"
 
-        # name map unavailable — return raw IDs so at least status shows
-        return player_ids, f"⚠️ League synced ({len(player_ids)} players) but name lookup failed"
+        return player_ids, (
+            f"⚠️ League synced ({len(player_ids)} players) — name lookup failed\n"
+            + "\n".join(name_debug)
+        )
 
     except requests.HTTPError as e:
         return set(), f"Sleeper API error: {e.response.status_code}"
@@ -212,6 +232,10 @@ with st.expander("🔍 Debug: name matching", expanded=False):
     st.write("**FPL names in predictions (first 10):**", sample_fpl)
     if available_only:
         st.write(f"**Players filtered out:** {len(predictions) - len(view)}")
+    # Show API diagnostic
+    _, name_debug = get_sleeper_name_map()
+    st.write("**API diagnostic:**")
+    st.code("\n".join(name_debug))
 
 st.dataframe(
     view[_DISPLAY_COLS].head(100),
