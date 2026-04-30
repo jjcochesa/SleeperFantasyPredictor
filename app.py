@@ -27,7 +27,7 @@ SLEEPER_API       = "https://api.sleeper.app/v1"
 
 _DISPLAY_COLS = [
     "display_name", "team", "opp", "ha", "fdr", "position", "form", "avail",
-    "exp_goals", "exp_assists", "exp_sot", "exp_kp", "exp_tkl", "exp_int",
+    "avg_pts_5", "exp_goals", "exp_assists", "exp_sot", "exp_kp", "exp_tkl", "exp_int",
     "exp_saves", "exp_cs", "sleeper_pts",
 ]
 
@@ -40,6 +40,7 @@ _COL_CONFIG = {
     "position":     st.column_config.TextColumn("Pos"),
     "form":         st.column_config.TextColumn("Form"),
     "avail":        st.column_config.TextColumn("Avail"),
+    "avg_pts_5":    st.column_config.NumberColumn("Avg Pts 5", format="%.1f"),
     "exp_goals":    st.column_config.NumberColumn("xG",    format="%.2f"),
     "exp_assists":  st.column_config.NumberColumn("xA",    format="%.2f"),
     "exp_sot":      st.column_config.NumberColumn("SoT",   format="%.2f"),
