@@ -2,7 +2,9 @@
 Sleeper Fantasy FPL Predictor — Streamlit Web App
 """
 
+import time
 import unicodedata
+from pathlib import Path
 import streamlit as st
 import pandas as pd
 import requests
@@ -241,16 +243,35 @@ if available_only and league_ok:
 
 st.caption(f"{len(view)} players shown")
 
-with st.expander("🔍 Debug: name matching", expanded=False):
+with st.expander("🔍 Debug", expanded=False):
+    # FBref cache status
+    st.write("**FBref Opta data (real stats source):**")
+    _fbref_tables = ["shooting", "passing", "defense", "possession", "misc", "keepers"]
+    _fbref_lines  = []
+    _cache_dir    = Path(".fpl_cache")
+    for _t in _fbref_tables:
+        _p = _cache_dir / f"fbref_{_t}.pkl"
+        if _p.exists():
+            _age_min = (time.time() - _p.stat().st_mtime) / 60
+            try:
+                _df_fb = pd.read_pickle(str(_p))
+                _fbref_lines.append(f"  ✅ {_t}: {len(_df_fb)} players — cached {_age_min:.0f} min ago")
+            except Exception:
+                _fbref_lines.append(f"  ⚠️ {_t}: cache corrupt")
+        else:
+            _fbref_lines.append(f"  ❌ {_t}: not fetched yet (loads on first Refresh)")
+    st.code("\n".join(_fbref_lines))
+
+    # Sleeper name matching
+    st.write("**Sleeper name matching:**")
     sample_drafted = sorted(drafted_ids)[:10]
     sample_fpl     = predictions[["name", "display_name"]].head(10).values.tolist()
-    st.write("**Drafted names from Sleeper (first 10):**", sample_drafted)
-    st.write("**FPL names in predictions (first 10):**", sample_fpl)
+    st.write("Drafted names from Sleeper (first 10):", sample_drafted)
+    st.write("FPL names in predictions (first 10):", sample_fpl)
     if available_only:
-        st.write(f"**Players filtered out:** {len(predictions) - len(view)}")
-    # Show API diagnostic
+        st.write(f"Players filtered out: {len(predictions) - len(view)}")
     _, name_debug = get_sleeper_name_map()
-    st.write("**API diagnostic:**")
+    st.write("**Sleeper API diagnostic:**")
     st.code("\n".join(name_debug))
 
 st.dataframe(
