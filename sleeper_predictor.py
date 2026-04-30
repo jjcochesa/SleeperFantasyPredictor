@@ -15,6 +15,8 @@ Requirements:
 
 import json
 import logging
+import time
+import unicodedata
 import warnings
 from datetime import datetime
 from pathlib import Path
@@ -91,6 +93,190 @@ def _current_season_str() -> str:
 def _pos_score(key: str, pos: str) -> float:
     v = SLEEPER_SCORING[key]
     return v.get(pos, 0) if isinstance(v, dict) else float(v)
+
+
+def _norm_name(name: str) -> str:
+    """Lowercase, strip accents — for FBref↔FPL name matching."""
+    nfkd = unicodedata.normalize("NFKD", name.lower().strip())
+    return "".join(c for c in nfkd if not unicodedata.combining(c))
+
+
+# ============================================================================
+# FBREF CLIENT
+# ============================================================================
+
+class FBrefClient:
+    """Scrape FBref Premier League stats tables (current season)."""
+
+    _BASE = "https://fbref.com/en/comps/9"
+    _ENDPOINTS = {
+        "shooting":   f"{_BASE}/shooting/Premier-League-Stats",
+        "passing":    f"{_BASE}/passing/Premier-League-Stats",
+        "defense":    f"{_BASE}/defense/Premier-League-Stats",
+        "possession": f"{_BASE}/possession/Premier-League-Stats",
+        "misc":       f"{_BASE}/misc/Premier-League-Stats",
+        "keepers":    f"{_BASE}/keepers/Premier-League-Stats",
+    }
+    _TABLE_IDS = {
+        "shooting":   "stats_shooting",
+        "passing":    "stats_passing",
+        "defense":    "stats_defense",
+        "possession": "stats_possession",
+        "misc":       "stats_misc",
+        "keepers":    "stats_keeper",
+    }
+    _CACHE_TTL = 6 * 3600  # 6 hours
+
+    def __init__(self, cache_dir: str = ".fpl_cache") -> None:
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(exist_ok=True)
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-GB,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Referer": "https://fbref.com/en/comps/9/Premier-League-Stats",
+        })
+
+    def _fetch_table(self, table_type: str) -> pd.DataFrame:
+        cache_path = self.cache_dir / f"fbref_{table_type}.pkl"
+        if cache_path.exists():
+            age = time.time() - cache_path.stat().st_mtime
+            if age < self._CACHE_TTL:
+                return pd.read_pickle(str(cache_path))
+
+        url      = self._ENDPOINTS[table_type]
+        table_id = self._TABLE_IDS[table_type]
+        log.info(f"🌐 Fetching FBref {table_type}...")
+        time.sleep(4)  # polite rate limit
+        r = self.session.get(url, timeout=30)
+        r.raise_for_status()
+
+        dfs = pd.read_html(r.text, attrs={"id": table_id})
+        df  = dfs[0]
+
+        # Flatten multi-level column headers
+        if isinstance(df.columns, pd.MultiIndex):
+            flat = []
+            for col in df.columns:
+                parts = [str(c) for c in col if "Unnamed" not in str(c) and str(c).strip()]
+                flat.append("_".join(parts) if parts else str(col[-1]))
+            df.columns = flat
+
+        # Drop repeated header rows FBref inserts in <tbody>
+        if "Player" in df.columns:
+            df = df[df["Player"] != "Player"].copy()
+
+        df.to_pickle(str(cache_path))
+        return df
+
+
+def load_fbref_per90(cache_dir: str = ".fpl_cache") -> dict[str, dict]:
+    """
+    Return {normalised_player_name: {stat: per90_value, ...}}.
+
+    Stats populated:
+      sot_per90, kp_per90, crs_per90, drb_per90,
+      tkl_per90, int_per90, blk_per90, clr_per90,
+      aer_per90, saves_per90
+    """
+    client = FBrefClient(cache_dir)
+    result: dict[str, dict] = {}
+
+    def _sf(val) -> float:
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return 0.0
+
+    def _p90(val, n90: float) -> float:
+        return _sf(val) / n90 if n90 > 0 else 0.0
+
+    def _col(df: pd.DataFrame, *keywords, exclude: str = "") -> str | None:
+        for kw in keywords:
+            for c in df.columns:
+                if kw in c and (not exclude or exclude not in c):
+                    return c
+        return None
+
+    def _populate(df: pd.DataFrame, stat_key: str, col_name: str | None,
+                  col_90s: str | None) -> None:
+        if col_name is None or col_90s is None or "Player" not in df.columns:
+            return
+        for _, row in df.iterrows():
+            name  = _norm_name(str(row["Player"]))
+            n90   = _sf(row[col_90s])
+            if not name or n90 <= 0:
+                continue
+            result.setdefault(name, {})[stat_key] = _p90(row[col_name], n90)
+
+    # ── Shooting: SoT ────────────────────────────────────────────────────────
+    try:
+        df = client._fetch_table("shooting")
+        n90 = _col(df, "90s")
+        _populate(df, "sot_per90", _col(df, "SoT", exclude="%"), n90)
+    except Exception as e:
+        log.warning(f"FBref shooting: {e}")
+
+    # ── Passing: KP, Crs ─────────────────────────────────────────────────────
+    try:
+        df = client._fetch_table("passing")
+        n90 = _col(df, "90s")
+        _populate(df, "kp_per90",  _col(df, "KP"),  n90)
+        _populate(df, "crs_per90", _col(df, "Crs"), n90)
+    except Exception as e:
+        log.warning(f"FBref passing: {e}")
+
+    # ── Defense: TklW, Int, Blocks_Sh, Clr ───────────────────────────────────
+    try:
+        df = client._fetch_table("defense")
+        n90 = _col(df, "90s")
+        _populate(df, "tkl_per90", _col(df, "TklW"), n90)
+        int_col = next((c for c in df.columns if c == "Int" or c.endswith("_Int")), None)
+        _populate(df, "int_per90", int_col, n90)
+        # Blocked shots: column under "Blocks" group named "Sh"
+        blk_col = next(
+            (c for c in df.columns if c.endswith("_Sh") or c == "Sh"),
+            None,
+        )
+        _populate(df, "blk_per90", blk_col, n90)
+        _populate(df, "clr_per90", _col(df, "Clr"), n90)
+    except Exception as e:
+        log.warning(f"FBref defense: {e}")
+
+    # ── Possession: Take-Ons Succ (successful dribbles) ──────────────────────
+    try:
+        df = client._fetch_table("possession")
+        n90 = _col(df, "90s")
+        drb_col = _col(df, "Succ", exclude="%")
+        _populate(df, "drb_per90", drb_col, n90)
+    except Exception as e:
+        log.warning(f"FBref possession: {e}")
+
+    # ── Misc: Aerial duels won ────────────────────────────────────────────────
+    try:
+        df = client._fetch_table("misc")
+        n90 = _col(df, "90s")
+        aer_col = next((c for c in df.columns if "Won" in c), None)
+        _populate(df, "aer_per90", aer_col, n90)
+    except Exception as e:
+        log.warning(f"FBref misc: {e}")
+
+    # ── Keepers: Saves ────────────────────────────────────────────────────────
+    try:
+        df = client._fetch_table("keepers")
+        n90 = _col(df, "90s")
+        _populate(df, "saves_per90", _col(df, "Saves", exclude="%"), n90)
+    except Exception as e:
+        log.warning(f"FBref keepers: {e}")
+
+    log.info(f"✓ FBref per-90 stats: {len(result)} players")
+    return result
 
 
 # ============================================================================
@@ -418,6 +604,13 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
         base.at[idx, "opp_att_str"]  = st.get(f"strength_attack_{side}", 1000)
         base.at[idx, "opp_def_str"]  = st.get(f"strength_defence_{side}", 1000)
 
+    # Load real Opta per-90 stats from FBref (graceful fallback to ICT if unavailable)
+    try:
+        fbref_stats = load_fbref_per90()
+    except Exception as e:
+        log.warning(f"FBref load failed, using ICT fallback: {e}")
+        fbref_stats = {}
+
     rows = []
     for _, row in base.iterrows():
         pos = row["position"]
@@ -447,7 +640,34 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
         def sc(stat: str) -> float:
             return s.get(stat, 0.0) * min_scale
 
-        # ICT-derived Opta stat estimates — position-specific conversion rates
+        # ── Fixture-difficulty + opponent-quality adjustments ─────────────────
+        fdr    = int(row.get("fdr", 3))
+        opp_gs = max(0.3, float(row.get("opp_gs_avg5", 1.3)))
+        opp_gc = max(0.3, float(row.get("opp_gc_avg5", 1.3)))
+
+        fdr_att = {1: 1.6, 2: 1.3, 3: 1.0, 4: 0.72, 5: 0.48}[fdr]
+        opp_def_factor = min(1.6, max(0.5, opp_gc / 1.3))
+        att_mult = fdr_att * opp_def_factor
+
+        fdr_def = {1: 0.65, 2: 0.82, 3: 1.0, 4: 1.25, 5: 1.55}[fdr]
+
+        # Physical maxima by position
+        GOAL_CAPS   = {"GK": 0.03, "DEF": 0.12, "MID": 0.40, "FWD": 0.80}
+        ASSIST_CAPS = {"GK": 0.02, "DEF": 0.25, "MID": 0.50, "FWD": 0.35}
+
+        adj_goals   = min(s.get("goals_scored", 0) * att_mult * min_scale,
+                          GOAL_CAPS[pos]   * min_scale)
+        adj_assists = min(s.get("assists",       0) * att_mult * min_scale,
+                          ASSIST_CAPS[pos] * min_scale)
+        adj_saves   = s.get("saves",          0) * fdr_def * min_scale
+        adj_gc      = s.get("goals_conceded", 0) * fdr_def * min_scale
+
+        # Poisson clean sheet: P(CS) = e^(-λ)
+        lambda_opp = opp_gs * fdr_def
+        prob_cs    = float(np.exp(-lambda_opp)) if exp_min >= 60 else 0.0
+        prob_cs    = min(0.85, prob_cs)
+
+        # ── ICT raw (no FDR yet) — used as fallback when FBref is missing ────
         thr = float(row.get("threat_avg5",     0))
         cre = float(row.get("creativity_avg5", 0))
         inf = float(row.get("influence_avg5",  0))
@@ -465,41 +685,41 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
             est_sot, est_kp, est_crs, est_drb = thr/18, cre/28, cre/25, cre/20
             est_tkl, est_int, est_blk, est_clr, est_aer = inf/55, inf/65, inf/55, 0.0, inf/14
 
-        # ── Fixture-difficulty + opponent-quality adjustments ─────────────────
-        fdr    = int(row.get("fdr", 3))
-        opp_gs = max(0.3, float(row.get("opp_gs_avg5", 1.3)))  # opp avg goals scored
-        opp_gc = max(0.3, float(row.get("opp_gc_avg5", 1.3)))  # opp avg goals conceded
+        # ── FBref real Opta per-90 overrides ─────────────────────────────────
+        # Form ratios: recent-5 vs season EWM-10 (clamped 0.3–2.0)
+        def _form(avg_col: str, ewm_col: str) -> float:
+            a = float(row.get(avg_col, 0.1))
+            e = float(row.get(ewm_col, 0.1))
+            return min(2.0, max(0.3, a / max(e, 0.1)))
 
-        # Attacking mult: easy fixture + weak defence = more output
-        fdr_att = {1: 1.6, 2: 1.3, 3: 1.0, 4: 0.72, 5: 0.48}[fdr]
-        opp_def_factor = min(1.6, max(0.5, opp_gc / 1.3))
-        att_mult = fdr_att * opp_def_factor
+        att_form = _form("threat_avg5",     "threat_ewm10")
+        cre_form = _form("creativity_avg5", "creativity_ewm10")
+        def_form = _form("influence_avg5",  "influence_ewm10")
 
-        # Defensive mult: hard fixture = more defensive actions
-        fdr_def = {1: 0.65, 2: 0.82, 3: 1.0, 4: 1.25, 5: 1.55}[fdr]
+        fb_key = _norm_name(str(row["name"]))
+        fb = fbref_stats.get(fb_key) or \
+             fbref_stats.get(_norm_name(str(row.get("display_name", ""))))  or {}
 
-        # Physical maxima by position — prevents model artifacts
-        GOAL_CAPS   = {"GK": 0.03, "DEF": 0.12, "MID": 0.40, "FWD": 0.80}
-        ASSIST_CAPS = {"GK": 0.02, "DEF": 0.25, "MID": 0.50, "FWD": 0.35}
+        if fb:
+            # Replace ICT fallback with real per-90 * recent-form scaling
+            if "sot_per90"   in fb: est_sot = fb["sot_per90"]   * att_form
+            if "kp_per90"    in fb: est_kp  = fb["kp_per90"]    * cre_form
+            if "crs_per90"   in fb: est_crs = fb["crs_per90"]   * cre_form
+            if "drb_per90"   in fb: est_drb = fb["drb_per90"]   * att_form
+            if "tkl_per90"   in fb: est_tkl = fb["tkl_per90"]   * def_form
+            if "int_per90"   in fb: est_int = fb["int_per90"]   * def_form
+            if "blk_per90"   in fb: est_blk = fb["blk_per90"]   * def_form
+            if "clr_per90"   in fb: est_clr = fb["clr_per90"]   * def_form
+            if "aer_per90"   in fb: est_aer = fb["aer_per90"]   * def_form
+            if "saves_per90" in fb and pos == "GK":
+                adj_saves = fb["saves_per90"] * def_form * fdr_def * min_scale
 
-        adj_goals   = min(s.get("goals_scored", 0) * att_mult * min_scale,
-                          GOAL_CAPS[pos]   * min_scale)
-        adj_assists = min(s.get("assists",       0) * att_mult * min_scale,
-                          ASSIST_CAPS[pos] * min_scale)
-        adj_saves   = s.get("saves",          0) * fdr_def * min_scale
-        adj_gc      = s.get("goals_conceded", 0) * fdr_def * min_scale
-
-        # Poisson clean sheet: P(CS) = e^(-λ), λ = expected opp goals this GW
-        lambda_opp = opp_gs * fdr_def
-        prob_cs    = float(np.exp(-lambda_opp)) if exp_min >= 60 else 0.0
-        prob_cs    = min(0.85, prob_cs)
-
-        # Apply FDR to ICT-derived stats
+        # ── Apply FDR uniformly (whether from FBref or ICT) ──────────────────
         est_sot *= att_mult;  est_kp  *= att_mult
         est_crs *= att_mult;  est_drb *= att_mult
         est_tkl *= fdr_def;   est_int *= fdr_def
         est_blk *= fdr_def;   est_clr *= fdr_def
-        # est_aer unchanged — aerial duel rate is roughly fixture-independent
+        # est_aer unchanged — aerial rate is roughly fixture-independent
 
         # Form indicator: compare last-3 avg points vs last-10 avg
         pts3  = float(row.get("total_points_avg3",  0))
