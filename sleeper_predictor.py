@@ -18,7 +18,6 @@ import logging
 import time
 import unicodedata
 import warnings
-from bs4 import BeautifulSoup, Comment
 from datetime import datetime
 from pathlib import Path
 
@@ -245,195 +244,6 @@ def load_sleeper_hist_pts(
     debug.append(f"  ✅ {len(result)} players with historical pts")
     debug.append(f"  Stat fields from API: {stat_keys_sample[:20]}")
     return result, debug
-
-
-# ============================================================================
-# FBREF CLIENT
-# ============================================================================
-
-class FBrefClient:
-    """Scrape FBref Premier League stats tables (current season)."""
-
-    _BASE = "https://fbref.com/en/comps/9"
-    _ENDPOINTS = {
-        "shooting":   f"{_BASE}/shooting/Premier-League-Stats",
-        "passing":    f"{_BASE}/passing/Premier-League-Stats",
-        "defense":    f"{_BASE}/defense/Premier-League-Stats",
-        "possession": f"{_BASE}/possession/Premier-League-Stats",
-        "misc":       f"{_BASE}/misc/Premier-League-Stats",
-        "keepers":    f"{_BASE}/keepers/Premier-League-Stats",
-    }
-    _TABLE_IDS = {
-        "shooting":   "stats_shooting",
-        "passing":    "stats_passing",
-        "defense":    "stats_defense",
-        "possession": "stats_possession",
-        "misc":       "stats_misc",
-        "keepers":    "stats_keeper",
-    }
-    _CACHE_TTL = 6 * 3600  # 6 hours
-
-    def __init__(self, cache_dir: str = ".fpl_cache") -> None:
-        self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(exist_ok=True)
-        self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-GB,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Referer": "https://fbref.com/en/comps/9/Premier-League-Stats",
-        })
-
-    def _fetch_table(self, table_type: str) -> pd.DataFrame:
-        cache_path = self.cache_dir / f"fbref_{table_type}.pkl"
-        if cache_path.exists():
-            age = time.time() - cache_path.stat().st_mtime
-            if age < self._CACHE_TTL:
-                return pd.read_pickle(str(cache_path))
-
-        url      = self._ENDPOINTS[table_type]
-        table_id = self._TABLE_IDS[table_type]
-        log.info(f"🌐 Fetching FBref {table_type}...")
-        time.sleep(4)  # polite rate limit
-        r = self.session.get(url, timeout=30)
-        r.raise_for_status()
-
-        # FBref hides many stat tables inside HTML comments — parse those too
-        soup  = BeautifulSoup(r.text, "lxml")
-        table = soup.find("table", {"id": table_id})
-
-        if table is None:
-            for comment in soup.find_all(string=lambda t: isinstance(t, Comment)):
-                if table_id in comment:
-                    sub = BeautifulSoup(comment, "lxml")
-                    table = sub.find("table", {"id": table_id})
-                    if table:
-                        break
-
-        if table is None:
-            raise ValueError(f"Table '{table_id}' not found on {url}")
-
-        dfs = pd.read_html(str(table))
-        df  = dfs[0]
-
-        # Flatten multi-level column headers
-        if isinstance(df.columns, pd.MultiIndex):
-            flat = []
-            for col in df.columns:
-                parts = [str(c) for c in col if "Unnamed" not in str(c) and str(c).strip()]
-                flat.append("_".join(parts) if parts else str(col[-1]))
-            df.columns = flat
-
-        # Drop repeated header rows FBref inserts in <tbody>
-        if "Player" in df.columns:
-            df = df[df["Player"] != "Player"].copy()
-
-        df.to_pickle(str(cache_path))
-        return df
-
-
-def load_fbref_per90(cache_dir: str = ".fpl_cache") -> dict[str, dict]:
-    """
-    Return {normalised_player_name: {stat: per90_value, ...}}.
-
-    Stats populated:
-      sot_per90, kp_per90, crs_per90, drb_per90,
-      tkl_per90, int_per90, blk_per90, clr_per90,
-      aer_per90, saves_per90
-    """
-    cache_path = Path(cache_dir)
-    cache_path.mkdir(exist_ok=True)
-    client = FBrefClient(cache_dir)
-    result: dict[str, dict] = {}
-
-    def _sf(val) -> float:
-        try:
-            return float(val)
-        except (ValueError, TypeError):
-            return 0.0
-
-    def _p90(val, n90: float) -> float:
-        return _sf(val) / n90 if n90 > 0 else 0.0
-
-    def _col(df: pd.DataFrame, *keywords, exclude: str = "") -> str | None:
-        for kw in keywords:
-            for c in df.columns:
-                if kw in c and (not exclude or exclude not in c):
-                    return c
-        return None
-
-    def _populate(df: pd.DataFrame, stat_key: str, col_name: str | None,
-                  col_90s: str | None) -> None:
-        if col_name is None or col_90s is None or "Player" not in df.columns:
-            return
-        for _, row in df.iterrows():
-            name  = _norm_name(str(row["Player"]))
-            n90   = _sf(row[col_90s])
-            if not name or n90 <= 0:
-                continue
-            result.setdefault(name, {})[stat_key] = _p90(row[col_name], n90)
-
-    def _try_table(table_type: str, action):
-        err_path = cache_path / f"fbref_{table_type}_error.txt"
-        try:
-            df = client._fetch_table(table_type)
-            action(df)
-            err_path.unlink(missing_ok=True)  # clear previous error
-        except Exception as e:
-            msg = str(e)
-            log.warning(f"FBref {table_type}: {msg}")
-            err_path.write_text(msg)
-
-    # ── Shooting: SoT ────────────────────────────────────────────────────────
-    def _shooting(df):
-        n90 = _col(df, "90s")
-        _populate(df, "sot_per90", _col(df, "SoT", exclude="%"), n90)
-    _try_table("shooting", _shooting)
-
-    # ── Passing: KP, Crs ─────────────────────────────────────────────────────
-    def _passing(df):
-        n90 = _col(df, "90s")
-        _populate(df, "kp_per90",  _col(df, "KP"),  n90)
-        _populate(df, "crs_per90", _col(df, "Crs"), n90)
-    _try_table("passing", _passing)
-
-    # ── Defense: TklW, Int, Blocks_Sh, Clr ───────────────────────────────────
-    def _defense(df):
-        n90     = _col(df, "90s")
-        int_col = next((c for c in df.columns if c == "Int" or c.endswith("_Int")), None)
-        blk_col = next((c for c in df.columns if c.endswith("_Sh") or c == "Sh"), None)
-        _populate(df, "tkl_per90", _col(df, "TklW"), n90)
-        _populate(df, "int_per90", int_col,           n90)
-        _populate(df, "blk_per90", blk_col,           n90)
-        _populate(df, "clr_per90", _col(df, "Clr"),  n90)
-    _try_table("defense", _defense)
-
-    # ── Possession: Take-Ons Succ (successful dribbles) ──────────────────────
-    def _possession(df):
-        n90 = _col(df, "90s")
-        _populate(df, "drb_per90", _col(df, "Succ", exclude="%"), n90)
-    _try_table("possession", _possession)
-
-    # ── Misc: Aerial duels won ────────────────────────────────────────────────
-    def _misc(df):
-        n90     = _col(df, "90s")
-        aer_col = next((c for c in df.columns if "Won" in c), None)
-        _populate(df, "aer_per90", aer_col, n90)
-    _try_table("misc", _misc)
-
-    # ── Keepers: Saves ────────────────────────────────────────────────────────
-    def _keepers(df):
-        n90 = _col(df, "90s")
-        _populate(df, "saves_per90", _col(df, "Saves", exclude="%"), n90)
-    _try_table("keepers", _keepers)
-
-    log.info(f"✓ FBref per-90 stats: {len(result)} players")
-    return result
 
 
 # ============================================================================
@@ -818,12 +628,7 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
         norm = _norm_name(player_name)
         return sleeper_hist.get(norm) or fpl_last5.get(player_name, 0.0)
 
-    # Load real Opta per-90 stats from FBref (graceful fallback to ICT if unavailable)
-    try:
-        fbref_stats = load_fbref_per90()
-    except Exception as e:
-        log.warning(f"FBref load failed, using ICT fallback: {e}")
-        fbref_stats = {}
+    fbref_stats: dict = {}  # FBref removed (403 blocked); Sleeper API used instead
 
     rows = []
     for _, row in base.iterrows():

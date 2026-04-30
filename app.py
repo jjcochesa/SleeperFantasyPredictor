@@ -245,26 +245,7 @@ if available_only and league_ok:
 st.caption(f"{len(view)} players shown")
 
 with st.expander("🔍 Debug", expanded=False):
-    # FBref cache status
-    st.write("**FBref Opta data (real stats source):**")
-    _fbref_tables = ["shooting", "passing", "defense", "possession", "misc", "keepers"]
-    _fbref_lines  = []
-    _cache_dir    = Path(".fpl_cache")
-    for _t in _fbref_tables:
-        _p = _cache_dir / f"fbref_{_t}.pkl"
-        if _p.exists():
-            _age_min = (time.time() - _p.stat().st_mtime) / 60
-            try:
-                _df_fb = pd.read_pickle(str(_p))
-                _fbref_lines.append(f"  ✅ {_t}: {len(_df_fb)} players — cached {_age_min:.0f} min ago")
-            except Exception as _e:
-                _fbref_lines.append(f"  ⚠️ {_t}: cache corrupt — {_e}")
-        else:
-            # Check for a logged error file
-            _err_p = _cache_dir / f"fbref_{_t}_error.txt"
-            _err   = _err_p.read_text().strip() if _err_p.exists() else "not fetched yet"
-            _fbref_lines.append(f"  ❌ {_t}: {_err}")
-    st.code("\n".join(_fbref_lines))
+    _cache_dir = Path(".fpl_cache")
 
     # Sleeper historical stats API
     st.write("**Sleeper stats API (historical points source):**")
