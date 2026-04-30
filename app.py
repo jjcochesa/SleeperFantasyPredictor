@@ -256,10 +256,13 @@ with st.expander("🔍 Debug", expanded=False):
             try:
                 _df_fb = pd.read_pickle(str(_p))
                 _fbref_lines.append(f"  ✅ {_t}: {len(_df_fb)} players — cached {_age_min:.0f} min ago")
-            except Exception:
-                _fbref_lines.append(f"  ⚠️ {_t}: cache corrupt")
+            except Exception as _e:
+                _fbref_lines.append(f"  ⚠️ {_t}: cache corrupt — {_e}")
         else:
-            _fbref_lines.append(f"  ❌ {_t}: not fetched yet (loads on first Refresh)")
+            # Check for a logged error file
+            _err_p = _cache_dir / f"fbref_{_t}_error.txt"
+            _err   = _err_p.read_text().strip() if _err_p.exists() else "not fetched yet"
+            _fbref_lines.append(f"  ❌ {_t}: {_err}")
     st.code("\n".join(_fbref_lines))
 
     # Sleeper name matching

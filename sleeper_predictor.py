@@ -18,6 +18,7 @@ import logging
 import time
 import unicodedata
 import warnings
+from bs4 import BeautifulSoup, Comment
 from datetime import datetime
 from pathlib import Path
 
@@ -157,7 +158,22 @@ class FBrefClient:
         r = self.session.get(url, timeout=30)
         r.raise_for_status()
 
-        dfs = pd.read_html(r.text, attrs={"id": table_id})
+        # FBref hides many stat tables inside HTML comments — parse those too
+        soup  = BeautifulSoup(r.text, "lxml")
+        table = soup.find("table", {"id": table_id})
+
+        if table is None:
+            for comment in soup.find_all(string=lambda t: isinstance(t, Comment)):
+                if table_id in comment:
+                    sub = BeautifulSoup(comment, "lxml")
+                    table = sub.find("table", {"id": table_id})
+                    if table:
+                        break
+
+        if table is None:
+            raise ValueError(f"Table '{table_id}' not found on {url}")
+
+        dfs = pd.read_html(str(table))
         df  = dfs[0]
 
         # Flatten multi-level column headers
@@ -185,6 +201,8 @@ def load_fbref_per90(cache_dir: str = ".fpl_cache") -> dict[str, dict]:
       tkl_per90, int_per90, blk_per90, clr_per90,
       aer_per90, saves_per90
     """
+    cache_path = Path(cache_dir)
+    cache_path.mkdir(exist_ok=True)
     client = FBrefClient(cache_dir)
     result: dict[str, dict] = {}
 
@@ -215,65 +233,59 @@ def load_fbref_per90(cache_dir: str = ".fpl_cache") -> dict[str, dict]:
                 continue
             result.setdefault(name, {})[stat_key] = _p90(row[col_name], n90)
 
+    def _try_table(table_type: str, action):
+        err_path = cache_path / f"fbref_{table_type}_error.txt"
+        try:
+            df = client._fetch_table(table_type)
+            action(df)
+            err_path.unlink(missing_ok=True)  # clear previous error
+        except Exception as e:
+            msg = str(e)
+            log.warning(f"FBref {table_type}: {msg}")
+            err_path.write_text(msg)
+
     # ── Shooting: SoT ────────────────────────────────────────────────────────
-    try:
-        df = client._fetch_table("shooting")
+    def _shooting(df):
         n90 = _col(df, "90s")
         _populate(df, "sot_per90", _col(df, "SoT", exclude="%"), n90)
-    except Exception as e:
-        log.warning(f"FBref shooting: {e}")
+    _try_table("shooting", _shooting)
 
     # ── Passing: KP, Crs ─────────────────────────────────────────────────────
-    try:
-        df = client._fetch_table("passing")
+    def _passing(df):
         n90 = _col(df, "90s")
         _populate(df, "kp_per90",  _col(df, "KP"),  n90)
         _populate(df, "crs_per90", _col(df, "Crs"), n90)
-    except Exception as e:
-        log.warning(f"FBref passing: {e}")
+    _try_table("passing", _passing)
 
     # ── Defense: TklW, Int, Blocks_Sh, Clr ───────────────────────────────────
-    try:
-        df = client._fetch_table("defense")
-        n90 = _col(df, "90s")
-        _populate(df, "tkl_per90", _col(df, "TklW"), n90)
+    def _defense(df):
+        n90     = _col(df, "90s")
         int_col = next((c for c in df.columns if c == "Int" or c.endswith("_Int")), None)
-        _populate(df, "int_per90", int_col, n90)
-        # Blocked shots: column under "Blocks" group named "Sh"
-        blk_col = next(
-            (c for c in df.columns if c.endswith("_Sh") or c == "Sh"),
-            None,
-        )
-        _populate(df, "blk_per90", blk_col, n90)
-        _populate(df, "clr_per90", _col(df, "Clr"), n90)
-    except Exception as e:
-        log.warning(f"FBref defense: {e}")
+        blk_col = next((c for c in df.columns if c.endswith("_Sh") or c == "Sh"), None)
+        _populate(df, "tkl_per90", _col(df, "TklW"), n90)
+        _populate(df, "int_per90", int_col,           n90)
+        _populate(df, "blk_per90", blk_col,           n90)
+        _populate(df, "clr_per90", _col(df, "Clr"),  n90)
+    _try_table("defense", _defense)
 
     # ── Possession: Take-Ons Succ (successful dribbles) ──────────────────────
-    try:
-        df = client._fetch_table("possession")
+    def _possession(df):
         n90 = _col(df, "90s")
-        drb_col = _col(df, "Succ", exclude="%")
-        _populate(df, "drb_per90", drb_col, n90)
-    except Exception as e:
-        log.warning(f"FBref possession: {e}")
+        _populate(df, "drb_per90", _col(df, "Succ", exclude="%"), n90)
+    _try_table("possession", _possession)
 
     # ── Misc: Aerial duels won ────────────────────────────────────────────────
-    try:
-        df = client._fetch_table("misc")
-        n90 = _col(df, "90s")
+    def _misc(df):
+        n90     = _col(df, "90s")
         aer_col = next((c for c in df.columns if "Won" in c), None)
         _populate(df, "aer_per90", aer_col, n90)
-    except Exception as e:
-        log.warning(f"FBref misc: {e}")
+    _try_table("misc", _misc)
 
     # ── Keepers: Saves ────────────────────────────────────────────────────────
-    try:
-        df = client._fetch_table("keepers")
+    def _keepers(df):
         n90 = _col(df, "90s")
         _populate(df, "saves_per90", _col(df, "Saves", exclude="%"), n90)
-    except Exception as e:
-        log.warning(f"FBref keepers: {e}")
+    _try_table("keepers", _keepers)
 
     log.info(f"✓ FBref per-90 stats: {len(result)} players")
     return result
