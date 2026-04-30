@@ -2,6 +2,7 @@
 Sleeper Fantasy FPL Predictor — Streamlit Web App
 """
 
+import json
 import time
 import unicodedata
 from pathlib import Path
@@ -264,6 +265,19 @@ with st.expander("🔍 Debug", expanded=False):
             _err   = _err_p.read_text().strip() if _err_p.exists() else "not fetched yet"
             _fbref_lines.append(f"  ❌ {_t}: {_err}")
     st.code("\n".join(_fbref_lines))
+
+    # Sleeper historical stats API
+    st.write("**Sleeper stats API (historical points source):**")
+    _slp_cache = _cache_dir / f"sleeper_hist_gw{gw - 1}.json"
+    _slp_keys  = _cache_dir / "sleeper_stat_keys.json"
+    if _slp_cache.exists():
+        _slp_data = json.loads(_slp_cache.read_text())
+        st.write(f"  ✅ {len(_slp_data)} players with Sleeper hist pts (GW{gw-5}–GW{gw-1})")
+        if _slp_keys.exists():
+            st.write("  Stat fields returned by Sleeper API:")
+            st.code(", ".join(json.loads(_slp_keys.read_text())))
+    else:
+        st.write("  ❌ Not fetched yet — click Refresh Predictions")
 
     # Sleeper name matching
     st.write("**Sleeper name matching:**")

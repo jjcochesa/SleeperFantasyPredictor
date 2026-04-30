@@ -91,6 +91,12 @@ def _current_season_str() -> str:
     return f"{str(y)[2:]}{str(y + 1)[2:]}"
 
 
+def _sleeper_season_year() -> int:
+    """Return start year of current soccer season (e.g. 2025 for 2025-26)."""
+    now = datetime.now()
+    return now.year if now.month >= 8 else now.year - 1
+
+
 def _pos_score(key: str, pos: str) -> float:
     v = SLEEPER_SCORING[key]
     return v.get(pos, 0) if isinstance(v, dict) else float(v)
@@ -100,6 +106,145 @@ def _norm_name(name: str) -> str:
     """Lowercase, strip accents — for FBref↔FPL name matching."""
     nfkd = unicodedata.normalize("NFKD", name.lower().strip())
     return "".join(c for c in nfkd if not unicodedata.combining(c))
+
+
+# ============================================================================
+# SLEEPER STATS API  (per-GW real points)
+# ============================================================================
+
+SLEEPER_API = "https://api.sleeper.app/v1"
+
+# Mapping from our SLEEPER_SCORING keys → Sleeper API stat field names
+_SLEEPER_FIELD = {
+    "goals":                ["gls", "goals_scored", "goals"],
+    "assists":              ["asts", "assists"],
+    "shots_on_target":      ["sog", "shots_on_target", "sot"],
+    "key_passes":           ["kp",  "key_passes"],
+    "successful_dribbles":  ["drb", "successful_dribbles", "dribbles"],
+    "accurate_crosses":     ["crs", "accurate_crosses", "crosses"],
+    "aerials_won":          ["aer", "aerials_won", "aerial_won"],
+    "effective_clearances": ["clr", "effective_clearances", "clearances"],
+    "saves":                ["svs", "saves"],
+    "clean_sheets":         ["cs",  "clean_sheets"],
+    "tackles_won":          ["tkl", "tackles_won", "tackles"],
+    "interceptions":        ["int", "interceptions"],
+    "blocked_shots":        ["blk", "blocked_shots", "blocks"],
+    "goals_against":        ["gc",  "goals_conceded", "goals_against"],
+    "own_goals":            ["og",  "own_goals"],
+    "penalties_missed":     ["pm",  "penalties_missed"],
+    "penalties_saved":      ["ps",  "penalties_saved"],
+    "yellow_card":          ["yc",  "yellow_cards", "yellow_card"],
+    "red_card":             ["rc",  "red_cards", "red_card"],
+    "minutes":              ["mins","minutes_played", "minutes"],
+}
+
+
+def _stat(stats: dict, key: str) -> float:
+    for field in _SLEEPER_FIELD.get(key, [key]):
+        v = stats.get(field)
+        if v is not None:
+            try:
+                return float(v)
+            except (ValueError, TypeError):
+                pass
+    return 0.0
+
+
+def _sleeper_pts_from_api(stats: dict, pos: str) -> float:
+    """Compute Sleeper points from a Sleeper API stats dict (full Opta stats)."""
+    mins = _stat(stats, "minutes") or 90
+    cs   = _stat(stats, "clean_sheets") if mins >= 60 else 0
+    return (
+        _stat(stats, "goals")               * _pos_score("goals",               pos)
+      + _stat(stats, "assists")              * _pos_score("assists",             pos)
+      + _stat(stats, "shots_on_target")      * SLEEPER_SCORING["shots_on_target"]
+      + _stat(stats, "key_passes")           * _pos_score("key_passes",         pos)
+      + _stat(stats, "successful_dribbles")  * SLEEPER_SCORING["successful_dribbles"]
+      + _stat(stats, "accurate_crosses")     * SLEEPER_SCORING["accurate_crosses"]
+      + _stat(stats, "aerials_won")          * _pos_score("aerials_won",        pos)
+      + _stat(stats, "effective_clearances") * _pos_score("effective_clearances",pos)
+      + _stat(stats, "saves")                * SLEEPER_SCORING["saves"]
+      + _stat(stats, "tackles_won")          * SLEEPER_SCORING["tackles_won"]
+      + _stat(stats, "interceptions")        * SLEEPER_SCORING["interceptions"]
+      + _stat(stats, "blocked_shots")        * SLEEPER_SCORING["blocked_shots"]
+      + _stat(stats, "goals_against")        * _pos_score("goals_against",      pos)
+      + _stat(stats, "own_goals")            * SLEEPER_SCORING["own_goals"]
+      + _stat(stats, "penalties_missed")     * SLEEPER_SCORING["penalties_missed"]
+      + _stat(stats, "penalties_saved")      * SLEEPER_SCORING["penalties_saved"]
+      + _stat(stats, "yellow_card")          * SLEEPER_SCORING["yellow_card"]
+      + _stat(stats, "red_card")             * SLEEPER_SCORING["red_card"]
+      + cs                                   * _pos_score("clean_sheet_60plus", pos)
+    )
+
+
+def load_sleeper_hist_pts(
+    current_gw: int,
+    name_map: dict[str, str],
+    pos_map: dict[str, str],
+    sport: str = "clubsoccer:epl",
+    cache_dir: str = ".fpl_cache",
+    n_weeks: int = 5,
+) -> tuple[dict[str, float], list[str]]:
+    """
+    Fetch last n_weeks of stats from Sleeper API.
+    Returns ({norm_player_name: avg_sleeper_pts}, [debug_lines]).
+    pos_map: {norm_player_name: position}
+    """
+    cache_dir_p = Path(cache_dir)
+    cache_dir_p.mkdir(exist_ok=True)
+    cache_file  = cache_dir_p / f"sleeper_hist_gw{current_gw}.json"
+
+    debug: list[str] = []
+
+    if cache_file.exists() and (time.time() - cache_file.stat().st_mtime) < 3600:
+        data = json.loads(cache_file.read_text())
+        debug.append("  ✅ Loaded from cache")
+        return data, debug
+
+    year     = _sleeper_season_year()
+    # Reverse name_map: norm_name -> player_id
+    norm2id  = {_norm_name(name): pid for pid, name in name_map.items()}
+
+    player_pts: dict[str, list[float]] = {}
+    stat_keys_sample: list[str] = []
+
+    for gw in range(max(1, current_gw - n_weeks), current_gw):
+        url = f"{SLEEPER_API}/stats/{sport}/regular/{year}/{gw}"
+        try:
+            r = requests.get(url, timeout=15)
+            debug.append(f"  GW{gw}: {url} → {r.status_code}")
+            if r.status_code != 200:
+                continue
+            week_stats = r.json()
+            if not week_stats:
+                debug.append(f"    (empty response)")
+                continue
+
+            # Capture stat field names from first player for debug
+            if not stat_keys_sample:
+                first = next(iter(week_stats.values()))
+                stat_keys_sample = sorted(first.keys()) if isinstance(first, dict) else []
+
+            for pid, stats in week_stats.items():
+                if not isinstance(stats, dict):
+                    continue
+                norm = _norm_name(name_map.get(str(pid), ""))
+                if not norm:
+                    continue
+                pos = pos_map.get(norm, "MID")
+                pts = _sleeper_pts_from_api(stats, pos)
+                player_pts.setdefault(norm, []).append(pts)
+
+        except Exception as e:
+            debug.append(f"  GW{gw}: error — {e}")
+
+    result = {name: round(sum(pts) / len(pts), 1)
+              for name, pts in player_pts.items() if pts}
+
+    cache_file.write_text(json.dumps(result))
+    debug.append(f"  ✅ {len(result)} players with historical pts")
+    debug.append(f"  Stat fields from API: {stat_keys_sample[:20]}")
+    return result, debug
 
 
 # ============================================================================
@@ -632,13 +777,46 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
         base.at[idx, "opp_att_str"]  = st.get(f"strength_attack_{side}", 1000)
         base.at[idx, "opp_def_str"]  = st.get(f"strength_defence_{side}", 1000)
 
-    # True last-5 Sleeper points average per player (no shift — display only)
-    last5_pts = (
+    # Position map for Sleeper stats scoring: norm_name -> position
+    pos_map = (
+        df.groupby("name")["position"].last()
+        .reset_index()
+        .assign(norm=lambda d: d["name"].map(_norm_name))
+        .set_index("norm")["position"]
+        .to_dict()
+    )
+
+    # Fetch last-5 GW points from Sleeper stats API (full Opta stats included)
+    # Need the Sleeper name_map; build a lightweight version from FPL names as fallback
+    try:
+        _r = requests.get(f"{SLEEPER_API}/players/clubsoccer:epl", timeout=30)
+        _name_map = {}
+        if _r.status_code == 200:
+            for pid, p in _r.json().items():
+                full = (p.get("full_name") or
+                        f"{p.get('first_name','')} {p.get('last_name','')}".strip())
+                if full.strip():
+                    _name_map[str(pid)] = full.strip()
+    except Exception:
+        _name_map = {}
+
+    sleeper_hist, _slp_debug = load_sleeper_hist_pts(
+        current_gw=next_gw - 1,
+        name_map=_name_map,
+        pos_map=pos_map,
+    )
+
+    # Fallback: FPL-derived partial Sleeper pts (missing Opta stats)
+    fpl_last5 = (
         df.sort_values("GW")
         .groupby("name")["sleeper_pts_hist"]
         .apply(lambda s: round(s.tail(5).mean(), 1))
         .to_dict()
     )
+
+    def _avg5(player_name: str) -> float:
+        norm = _norm_name(player_name)
+        return sleeper_hist.get(norm) or fpl_last5.get(player_name, 0.0)
 
     # Load real Opta per-90 stats from FBref (graceful fallback to ICT if unavailable)
     try:
@@ -802,7 +980,7 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
             "form":         form,
             "GW":           next_gw,
             "avail":        f"{int(chance)}%" if status != "a" else "OK",
-            "avg_pts_5":    last5_pts.get(row["name"], 0.0),
+            "avg_pts_5":    _avg5(row["name"]),
             "exp_min":      round(exp_min, 1),
             "exp_goals":    round(adj_goals,   2),
             "exp_assists":  round(adj_assists, 2),
