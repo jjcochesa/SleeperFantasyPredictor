@@ -366,15 +366,30 @@ def load_fpl_data(client: FPLDataClient, boot: dict) -> pd.DataFrame:
         pid = int(el["id"])
         av  = avail.get(pid, {})
 
+        pos = POSITION_MAP.get(el["element_type"], "MID")
         for gw in summary.get("history", []):
+            mins = gw["minutes"]
+            cs   = gw["clean_sheets"] if mins >= 60 else 0
+            slp  = (
+                gw["goals_scored"]          * _pos_score("goals",               pos)
+              + gw["assists"]               * _pos_score("assists",             pos)
+              + gw["saves"]                 * SLEEPER_SCORING["saves"]
+              + gw["goals_conceded"]        * _pos_score("goals_against",       pos)
+              + gw.get("own_goals", 0)      * SLEEPER_SCORING["own_goals"]
+              + gw.get("penalties_missed",0)* SLEEPER_SCORING["penalties_missed"]
+              + gw.get("penalties_saved", 0)* SLEEPER_SCORING["penalties_saved"]
+              + gw["yellow_cards"]          * SLEEPER_SCORING["yellow_card"]
+              + gw["red_cards"]             * SLEEPER_SCORING["red_card"]
+              + cs                          * _pos_score("clean_sheet_60plus",  pos)
+            )
             rows.append({
                 "name":             f"{el['first_name']} {el['second_name']}",
                 "display_name":     el.get("web_name", el["second_name"]),
                 "player_id":        pid,
                 "team":             team_map.get(el["team"], str(el["team"])),
-                "position":         POSITION_MAP.get(el["element_type"]),
+                "position":         pos,
                 "GW":               gw["round"],
-                "minutes":          gw["minutes"],
+                "minutes":          mins,
                 "goals_scored":     gw["goals_scored"],
                 "assists":          gw["assists"],
                 "clean_sheets":     gw["clean_sheets"],
@@ -390,6 +405,7 @@ def load_fpl_data(client: FPLDataClient, boot: dict) -> pd.DataFrame:
                 "threat":           float(gw["threat"]),
                 "ict_index":        float(gw["ict_index"]),
                 "total_points":            gw["total_points"],
+                "sleeper_pts_hist":        round(slp, 2),
                 "expected_goals_conceded": float(gw.get("expected_goals_conceded", 0) or 0),
                 "own_goals":            gw.get("own_goals", 0),
                 "penalties_missed":     gw.get("penalties_missed", 0),
@@ -616,10 +632,10 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
         base.at[idx, "opp_att_str"]  = st.get(f"strength_attack_{side}", 1000)
         base.at[idx, "opp_def_str"]  = st.get(f"strength_defence_{side}", 1000)
 
-    # True last-5 average points per player (no shift — for display only, not training)
+    # True last-5 Sleeper points average per player (no shift — display only)
     last5_pts = (
         df.sort_values("GW")
-        .groupby("name")["total_points"]
+        .groupby("name")["sleeper_pts_hist"]
         .apply(lambda s: round(s.tail(5).mean(), 1))
         .to_dict()
     )
