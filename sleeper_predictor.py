@@ -616,6 +616,14 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
         base.at[idx, "opp_att_str"]  = st.get(f"strength_attack_{side}", 1000)
         base.at[idx, "opp_def_str"]  = st.get(f"strength_defence_{side}", 1000)
 
+    # True last-5 average points per player (no shift — for display only, not training)
+    last5_pts = (
+        df.sort_values("GW")
+        .groupby("name")["total_points"]
+        .apply(lambda s: round(s.tail(5).mean(), 1))
+        .to_dict()
+    )
+
     # Load real Opta per-90 stats from FBref (graceful fallback to ICT if unavailable)
     try:
         fbref_stats = load_fbref_per90()
@@ -778,7 +786,7 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
             "form":         form,
             "GW":           next_gw,
             "avail":        f"{int(chance)}%" if status != "a" else "OK",
-            "avg_pts_5":    round(float(row.get("total_points_avg5", 0)), 1),
+            "avg_pts_5":    last5_pts.get(row["name"], 0.0),
             "exp_min":      round(exp_min, 1),
             "exp_goals":    round(adj_goals,   2),
             "exp_assists":  round(adj_assists, 2),
