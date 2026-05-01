@@ -191,7 +191,7 @@ def load_sleeper_hist_pts(
     cache_dir_p.mkdir(exist_ok=True)
     start_gw    = max(1, current_gw - n_weeks + 1)
     cache_file  = cache_dir_p / f"sleeper_hist_gw{start_gw}_{current_gw}.json"
-    per90_file  = cache_dir_p / f"sleeper_per90_v3_gw{start_gw}_{current_gw}.json"
+    per90_file  = cache_dir_p / f"sleeper_per90_v4_gw{start_gw}_{current_gw}.json"
 
     debug: list[str] = []
 
@@ -244,19 +244,17 @@ def load_sleeper_hist_pts(
     # Compute per-90 averages — include every stat Sleeper scores
     per90: dict[str, dict] = {}
     _per90_keys = [
-        "gs", "ast", "asts",           # goals, assists
+        "g",                           # goals scored (gs = games started, not goals!)
+        "ast", "asts",                 # assists (try both field names)
         "sot", "kp", "acnc", "drb",    # attacking
-        "int", "tkw", "clr", "aer",    # defensive (tkw = tackles won, separate from int)
-        "bs",                          # blocked shots (Sleeper field: bs not blk)
-        "sv",                          # GK saves (Sleeper field: sv)
-        "yc", "rc",                    # cards
-        "ga",                          # goals against (GK/DEF)
+        "int", "tkw", "clr", "aer",    # defensive
+        "bs",                          # blocked shots
+        "sv",                          # GK saves
+        "yc", "rc", "yc2",            # cards
+        "ga", "og",                    # goals against, own goals
         "dis",                         # dispossessed
-        "sm",                          # smothers (Sleeper field: sm not smo)
-        "hcs",                         # high claims succeeded
-        "pkd",                         # penalty kicks drawn
-        "yc2",                         # 2nd yellow card
-        "ps",                          # penalty kick saves
+        "sm", "hcs",                   # smothers, high claims
+        "pkd", "pkm", "ps",           # pen kicks drawn/missed/saved
     ]
     for norm, gw_list in player_stats.items():
         totals: dict[str, float] = {}
@@ -723,11 +721,12 @@ def predict_next_gw(df: pd.DataFrame,
             est_tkl = est_int = adj_saves = 0.0
             prob_cs_out = 0.0
         else:
-            # Goals: blend Sleeper gs_per90 (actual) with Understat xG (expected).
+            # Goals: blend Sleeper g_per90 (actual) with Understat xG (expected).
+            # NOTE: gs = games started (not goals). Goals field is "g".
             # xG regresses lucky/unlucky periods toward true quality.
-            gs_per90  = sp.get("gs",  0.0)
-            xg_per90  = us.get("xg_per90", gs_per90)
-            raw_goals = 0.4 * gs_per90 + 0.6 * xg_per90
+            g_per90   = sp.get("g",   0.0)
+            xg_per90  = us.get("xg_per90", g_per90)
+            raw_goals = 0.4 * g_per90 + 0.6 * xg_per90
             adj_goals = min(
                 max(raw_goals * att_mult * ha_mult * min_scale, GOAL_FLOOR[pos]),
                 GOAL_CAPS[pos] * min_scale,
@@ -768,10 +767,12 @@ def predict_next_gw(df: pd.DataFrame,
             adj_yc2 = sp.get("yc2", 0.0) * min_scale
 
             # Other Sleeper scoring stats (intrinsic to player style)
-            adj_smo = sp.get("sm",  0.0) * min_scale  # smothers (field: sm)
+            adj_smo = sp.get("sm",  0.0) * min_scale  # smothers
             adj_hcs = sp.get("hcs", 0.0) * min_scale  # high claims succeeded
             adj_dis = sp.get("dis", 0.0) * min_scale  # dispossessed
             adj_pkd = sp.get("pkd", 0.0) * min_scale  # penalty kicks drawn
+            adj_pkm = sp.get("pkm", 0.0) * min_scale  # penalty kicks missed (field: pkm)
+            adj_og  = sp.get("og",  0.0) * min_scale  # own goals
             adj_ps  = sp.get("ps",  0.0) * min_scale  # penalty kick saves
 
             prob_cs_out = prob_cs
@@ -798,6 +799,8 @@ def predict_next_gw(df: pd.DataFrame,
               + adj_hcs     * SLEEPER_SCORING["high_claims"]
               + adj_dis     * SLEEPER_SCORING["dispossessed"]
               + adj_pkd     * SLEEPER_SCORING["penalty_kicks_drawn"]
+              + adj_pkm     * SLEEPER_SCORING["penalties_missed"]
+              + adj_og      * SLEEPER_SCORING["own_goals"]
               + adj_ps      * SLEEPER_SCORING["penalties_saved"]
             )
 
