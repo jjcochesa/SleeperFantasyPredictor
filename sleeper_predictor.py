@@ -736,12 +736,34 @@ def predict_next_gw(df: pd.DataFrame,
         avg5 = _avg5(row["name"])
 
         if not sp:
-            # No Sleeper per-90 data — fall back to fixture-adjusted historical avg
+            # No Sleeper per-90 data — pure historical avg (no stat blend possible)
             fixture_mult = (att_mult + fdr_def) / 2.0 * ha_mult
             pts = avg5 * fixture_mult * min_scale
             adj_goals = adj_assists = est_sot = est_kp = 0.0
             est_tkl = est_int = adj_saves = 0.0
             prob_cs_out = 0.0
+            pts *= avail_mult
+            rows.append({
+                "name":         row["name"],
+                "display_name": row.get("display_name", row["name"]),
+                "player_id":    row.get("player_id", ""),
+                "team":         row["team"],
+                "opp":          row.get("opp", "TBC"),
+                "ha":           row.get("ha", "?"),
+                "fdr":          int(row.get("fdr", 3)),
+                "position":     pos,
+                "form":         form,
+                "GW":           next_gw,
+                "avail":        f"{int(chance)}%" if status != "a" else "OK",
+                "avg_pts_5":    avg5,
+                "exp_min":      round(exp_min, 1),
+                "exp_goals":    0.0, "exp_assists": 0.0,
+                "exp_sot":      0.0, "exp_kp":      0.0,
+                "exp_tkl":      0.0, "exp_int":     0.0,
+                "exp_saves":    0.0, "exp_cs":      0.0,
+                "sleeper_pts":  round(pts, 2),
+            })
+            continue
         else:
             # Goals: blend Sleeper g_per90 (actual) with Understat xG (expected).
             # NOTE: gs = games started (not goals). Goals field is "g".
@@ -802,7 +824,7 @@ def predict_next_gw(df: pd.DataFrame,
 
             prob_cs_out = prob_cs
 
-            pts = (
+            stat_pts = (
                 adj_goals   * _pos_score("goals", pos)
               + adj_assists * _pos_score("assists", pos)
               + adj_saves   * SLEEPER_SCORING["saves"]
@@ -828,6 +850,11 @@ def predict_next_gw(df: pd.DataFrame,
               + adj_og      * SLEEPER_SCORING["own_goals"]
               + adj_ps      * SLEEPER_SCORING["penalties_saved"]
             )
+            # Blend 70% stat model + 30% fixture-adjusted historical avg.
+            # The historical component anchors player quality — prevents hot-streak
+            # inflation (Flemming ≈ Watkins) and cold-patch underrating (Van Hecke).
+            hist_mult = (att_mult + fdr_def) / 2.0 * ha_mult * min_scale
+            pts = 0.70 * stat_pts + 0.30 * (avg5 * hist_mult)
 
         pts *= avail_mult
 
