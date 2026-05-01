@@ -719,10 +719,8 @@ def predict_next_gw(df: pd.DataFrame,
     understat_xg = load_understat_xg()
     log.info(f"Understat xG/xA loaded for {len(understat_xg)} players")
 
-    GOAL_CAPS    = {"GK": 0.03, "DEF": 0.12, "MID": 0.40, "FWD": 0.80}
-    ASSIST_CAPS  = {"GK": 0.02, "DEF": 0.25, "MID": 0.50, "FWD": 0.35}
-    GOAL_FLOOR   = {"GK": 0.005, "DEF": 0.01, "MID": 0.03, "FWD": 0.05}
-    ASSIST_FLOOR = {"GK": 0.002, "DEF": 0.005, "MID": 0.01, "FWD": 0.01}
+    GOAL_FLOOR   = {"GK": 0.003, "DEF": 0.005, "MID": 0.01, "FWD": 0.02}
+    ASSIST_FLOOR = {"GK": 0.001, "DEF": 0.003, "MID": 0.005, "FWD": 0.005}
 
     rows = []
     for _, row in base.iterrows():
@@ -830,19 +828,13 @@ def predict_next_gw(df: pd.DataFrame,
             fpl_xa_per90 = float(row.get("expected_assists_avg5", 0) or 0) / mins90
             xg_per90  = us.get("xg_per90", fpl_xg_per90)
             raw_goals = 0.4 * g_per90 + 0.6 * xg_per90
-            adj_goals = min(
-                max(raw_goals * att_mult * ha_mult * min_scale, GOAL_FLOOR[pos]),
-                GOAL_CAPS[pos] * min_scale,
-            )
+            adj_goals = max(raw_goals * att_mult * ha_mult * min_scale, GOAL_FLOOR[pos])
 
             # Assists: same blend
             ast_per90   = sp.get("ast", 0.0)
             xa_per90    = us.get("xa_per90", fpl_xa_per90)
             raw_assists = 0.4 * ast_per90 + 0.6 * xa_per90
-            adj_assists = min(
-                max(raw_assists * att_mult * ha_mult * min_scale, ASSIST_FLOOR[pos]),
-                ASSIST_CAPS[pos] * min_scale,
-            )
+            adj_assists = max(raw_assists * att_mult * ha_mult * min_scale, ASSIST_FLOOR[pos])
 
             # Attacking stats (scale with attacking fixture difficulty + H/A)
             est_sot = sp.get("sot",  0.0) * att_mult * ha_mult * min_scale
