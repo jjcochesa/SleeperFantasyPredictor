@@ -674,19 +674,29 @@ def predict_next_gw(df: pd.DataFrame,
         .to_dict()
     )
 
-    # Fetch last-5 GW points from Sleeper stats API (full Opta stats included)
-    # Need the Sleeper name_map; build a lightweight version from FPL names as fallback
+    # Fetch Sleeper player DB — used for name→pts lookup AND position correction.
+    # FPL classifies many forwards as MID (Gakpo, Sarr, Minteh, Rogers, etc.).
+    # Sleeper's position is the ground truth for our scoring system.
+    _SLEEPER_POS_MAP = {"FWD": "FWD", "MID": "MID", "DEF": "DEF", "GK": "GK",
+                        "F": "FWD", "M": "MID", "D": "DEF",
+                        "ATT": "FWD", "ATC": "MID", "W": "FWD"}
     try:
         _r = requests.get(f"{SLEEPER_API}/players/clubsoccer:epl", timeout=30)
         _name_map = {}
+        _sleeper_pos = {}  # norm_name -> Sleeper position
         if _r.status_code == 200:
             for pid, p in _r.json().items():
                 full = (p.get("full_name") or
                         f"{p.get('first_name','')} {p.get('last_name','')}".strip())
                 if full.strip():
                     _name_map[str(pid)] = full.strip()
+                    raw_pos = str(p.get("position", "") or "").upper()
+                    slp_pos = _SLEEPER_POS_MAP.get(raw_pos)
+                    if slp_pos:
+                        _sleeper_pos[_norm_name(full.strip())] = slp_pos
     except Exception:
         _name_map = {}
+        _sleeper_pos = {}
 
     sleeper_hist, sleeper_per90, _slp_debug = load_sleeper_hist_pts(
         current_gw=next_gw - 1,
@@ -716,9 +726,17 @@ def predict_next_gw(df: pd.DataFrame,
 
     rows = []
     for _, row in base.iterrows():
-        pos = row["position"]
-        if pos not in ("GK", "DEF", "MID", "FWD"):
+        fpl_pos = row["position"]
+        if fpl_pos not in ("GK", "DEF", "MID", "FWD"):
             continue
+        # Use Sleeper position where available — FPL classifies many FWDs as MID
+        # (Gakpo, Sarr, Minteh, Rogers, etc.) which halves their goal cap and
+        # gives them an incorrect clean-sheet bonus.
+        slp_key_pos = _norm_name(str(row["name"]))
+        alt_key_pos = _norm_name(str(row.get("display_name", "")))
+        pos = (_sleeper_pos.get(slp_key_pos)
+               or _sleeper_pos.get(alt_key_pos)
+               or fpl_pos)
 
         status = row.get("status", "a")
         chance = float(row.get("chance_of_playing", 100))
