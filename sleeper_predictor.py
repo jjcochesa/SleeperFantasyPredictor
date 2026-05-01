@@ -647,15 +647,11 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
         if pos not in bundle:
             continue
 
-        # Availability multiplier
+        # Availability: only zero out confirmed out (injured/suspended/0% chance).
+        # Doubtful players keep full predicted pts — availability is display-only info.
         status = row.get("status", "a")
         chance = float(row.get("chance_of_playing", 100))
-        if status in ("i", "s") or chance == 0:
-            avail_mult = 0.0
-        elif status == "d":
-            avail_mult = chance / 100
-        else:
-            avail_mult = 1.0
+        avail_mult = 0.0 if (status in ("i", "s") or chance == 0) else 1.0
 
         x = row[feature_cols].fillna(0).to_frame().T.astype(float)
 
@@ -781,16 +777,21 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
           + est_blk * min_scale * SLEEPER_SCORING["blocked_shots"]
           + est_clr * min_scale * _pos_score("effective_clearances", pos)
           + est_aer * min_scale * _pos_score("aerials_won", pos)
-        ) * avail_mult
+        )
 
         # Blend stat projection with historical Sleeper average.
-        # Per-stat projections systematically underestimate high-variance players;
         # pts_std from the Sleeper API is the ground truth anchor.
+        # Home advantage: ~8% boost at home, ~7% cut away (PL average).
         avg5 = _avg5(row["name"])
-        if avg5 > 0 and avail_mult > 0:
-            fixture_mult = (att_mult + fdr_def) / 2.0
-            hist_pts = avg5 * fixture_mult * min_scale * avail_mult
+        if avg5 > 0:
+            is_home    = int(row.get("was_home", 1))
+            ha_mult    = 1.08 if is_home else 0.93
+            fixture_mult = (att_mult + fdr_def) / 2.0 * ha_mult
+            hist_pts   = avg5 * fixture_mult * min_scale
             pts = 0.4 * pts + 0.6 * hist_pts
+
+        # Zero out confirmed absentees after blending
+        pts *= avail_mult
 
         rows.append({
             "name":         row["name"],
