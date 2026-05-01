@@ -747,7 +747,10 @@ def predict_next_gw(df: pd.DataFrame,
             # NOTE: gs = games started (not goals). Goals field is "g".
             # xG regresses lucky/unlucky periods toward true quality.
             g_per90   = sp.get("g",   0.0)
-            xg_per90  = us.get("xg_per90", g_per90)
+            mins90 = max(0.5, float(row.get("minutes_avg5", 60)) / 90)
+            fpl_xg_per90 = float(row.get("expected_goals_avg5",  0) or 0) / mins90
+            fpl_xa_per90 = float(row.get("expected_assists_avg5", 0) or 0) / mins90
+            xg_per90  = us.get("xg_per90", fpl_xg_per90)
             raw_goals = 0.4 * g_per90 + 0.6 * xg_per90
             adj_goals = min(
                 max(raw_goals * att_mult * ha_mult * min_scale, GOAL_FLOOR[pos]),
@@ -756,7 +759,7 @@ def predict_next_gw(df: pd.DataFrame,
 
             # Assists: same blend
             ast_per90   = sp.get("ast", 0.0)
-            xa_per90    = us.get("xa_per90", ast_per90)
+            xa_per90    = us.get("xa_per90", fpl_xa_per90)
             raw_assists = 0.4 * ast_per90 + 0.6 * xa_per90
             adj_assists = min(
                 max(raw_assists * att_mult * ha_mult * min_scale, ASSIST_FLOOR[pos]),
