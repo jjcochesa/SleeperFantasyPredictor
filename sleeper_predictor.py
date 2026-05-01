@@ -666,7 +666,7 @@ def predict_next_gw(df: pd.DataFrame,
     GOAL_CAPS    = {"GK": 0.03, "DEF": 0.12, "MID": 0.40, "FWD": 0.80}
     ASSIST_CAPS  = {"GK": 0.02, "DEF": 0.25, "MID": 0.50, "FWD": 0.35}
     GOAL_FLOOR   = {"GK": 0.005, "DEF": 0.01, "MID": 0.03, "FWD": 0.05}
-    ASSIST_FLOOR = {"GK": 0.005, "DEF": 0.02, "MID": 0.04, "FWD": 0.04}
+    ASSIST_FLOOR = {"GK": 0.002, "DEF": 0.005, "MID": 0.01, "FWD": 0.01}
 
     rows = []
     for _, row in base.iterrows():
@@ -711,6 +711,20 @@ def predict_next_gw(df: pd.DataFrame,
         alt_key = _norm_name(str(row.get("display_name", "")))
         sp = sleeper_per90.get(slp_key) or sleeper_per90.get(alt_key) or {}
         us = understat_xg.get(slp_key)  or understat_xg.get(alt_key)  or {}
+
+        # Fallback: match on 2+ shared words — catches "David Raya" → "David Raya Martin"
+        if not sp:
+            slp_words = set(slp_key.split())
+            for k, v in sleeper_per90.items():
+                if len(slp_words & set(k.split())) >= 2:
+                    sp = v
+                    break
+        if not us:
+            slp_words = set(slp_key.split())
+            for k, v in understat_xg.items():
+                if len(slp_words & set(k.split())) >= 2:
+                    us = v
+                    break
         avg5 = _avg5(row["name"])
 
         if not sp:
