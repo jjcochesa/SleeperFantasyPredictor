@@ -14,7 +14,6 @@ from sleeper_predictor import (
     FPLDataClient,
     load_current_season_data,
     engineer_features,
-    train_component_models,
     predict_next_gw,
 )
 
@@ -180,8 +179,7 @@ def get_predictions() -> pd.DataFrame:
     fixtures   = fpl_client.fixtures()
     df, ts     = load_current_season_data(fpl_client, boot, fixtures)
     feat       = engineer_features(df)
-    bundle, feature_cols = train_component_models(feat)
-    return predict_next_gw(feat, bundle, feature_cols, ts, fixtures, boot)
+    return predict_next_gw(feat, ts, fixtures, boot)
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────

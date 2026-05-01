@@ -21,11 +21,11 @@ import warnings
 from datetime import datetime
 from pathlib import Path
 
+import re
+
 import numpy as np
 import pandas as pd
 import requests
-from lightgbm import LGBMRegressor, early_stopping as lgb_early_stopping
-from sklearn.model_selection import TimeSeriesSplit
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -61,15 +61,6 @@ SLEEPER_SCORING = {
     "penalties_saved":       8.0,
 }
 
-# Stats the model is trained to predict
-TRAIN_TARGETS = [
-    "goals_scored", "assists", "expected_goals", "expected_assists",
-    "clean_sheets", "saves", "yellow_cards", "red_cards",
-    "goals_conceded", "own_goals", "penalties_missed", "penalties_saved",
-]
-
-NON_FEATURE = {"name", "display_name", "team", "position", "GW", "minutes",
-               "player_id", "status", "chance_of_playing"}
 
 FPL_ROLLING_STATS = [
     "goals_scored", "assists", "expected_goals", "expected_assists",
@@ -239,9 +230,16 @@ def load_sleeper_hist_pts(
 
     # Compute per-90 averages from season stats (for projection model)
     per90: dict[str, dict] = {}
-    _per90_keys = ["sot", "kp", "acnc", "drb", "int", "clr", "aer", "svs", "saves"]
+    _per90_keys = [
+        "gs", "ast", "asts",           # goals, assists
+        "sot", "kp", "acnc", "drb",    # attacking
+        "int", "clr", "aer",           # defensive
+        "svs", "saves",                # GK saves
+        "yc", "rc",                    # cards
+        "ga",                          # goals against
+    ]
     for norm, gw_list in player_stats.items():
-        totals = {}
+        totals: dict[str, float] = {}
         total_min = 0.0
         for s in gw_list:
             total_min += float(s.get("min", 0) or 0)
@@ -249,12 +247,67 @@ def load_sleeper_hist_pts(
                 totals[k] = totals.get(k, 0.0) + float(s.get(k, 0) or 0)
         if total_min >= 90:
             n90 = total_min / 90
-            per90[norm] = {k: round(v / n90, 3) for k, v in totals.items()}
+            p90 = {k: round(v / n90, 3) for k, v in totals.items()}
+            # Normalise assist field — Sleeper uses either "ast" or "asts"
+            p90["ast"] = max(p90.get("ast", 0.0), p90.get("asts", 0.0))
+            per90[norm] = p90
 
     cache_file.write_text(json.dumps(avg_pts))
     per90_file.write_text(json.dumps(per90))
     debug.append(f"  ✅ {len(avg_pts)} players with historical pts, {len(per90)} with per-90 stats")
     return avg_pts, per90, debug
+
+
+def load_understat_xg(cache_dir: str = ".fpl_cache") -> dict[str, dict]:
+    """
+    Fetch season xG/xA per player from Understat.
+    Returns {norm_name: {xg_per90, xa_per90}}.
+    xG/xA are better predictors of future scoring than raw goals/assists.
+    """
+    cache_dir_p = Path(cache_dir)
+    cache_dir_p.mkdir(exist_ok=True)
+    year = _sleeper_season_year()
+    cache_file = cache_dir_p / f"understat_xg_{year}.json"
+
+    if cache_file.exists() and (time.time() - cache_file.stat().st_mtime) < 3600 * 6:
+        return json.loads(cache_file.read_text())
+
+    url = f"https://understat.com/league/EPL/{year}"
+    try:
+        r = requests.get(url, timeout=15,
+                         headers={"User-Agent": "Mozilla/5.0 (compatible; stats-fetcher/1.0)"})
+        if r.status_code != 200:
+            log.warning(f"Understat returned {r.status_code}")
+            return {}
+
+        m = re.search(r"playersData\s*=\s*JSON\.parse\('(.+?)'\)", r.text)
+        if not m:
+            log.warning("Understat: playersData not found in page")
+            return {}
+
+        # Understat encodes the JSON string with unicode escapes
+        raw = m.group(1).encode("utf-8").decode("unicode_escape")
+        players = json.loads(raw)
+
+        result: dict[str, dict] = {}
+        for p in players:
+            name = _norm_name(str(p.get("player_name", "")))
+            mins = float(p.get("time", 0) or 0)
+            if not name or mins < 90:
+                continue
+            n90 = mins / 90
+            result[name] = {
+                "xg_per90": round(float(p.get("xG", 0) or 0) / n90, 3),
+                "xa_per90": round(float(p.get("xA", 0) or 0) / n90, 3),
+            }
+
+        cache_file.write_text(json.dumps(result))
+        log.info(f"✅ Understat: {len(result)} players with xG/xA")
+        return result
+
+    except Exception as e:
+        log.warning(f"Understat fetch failed: {e}")
+        return {}
 
 
 # ============================================================================
@@ -498,68 +551,10 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================================
-# MODEL TRAINING
-# ============================================================================
-
-def train_component_models(df: pd.DataFrame) -> tuple[dict, list]:
-    """One LGBMRegressor per (position, target stat), time-series CV."""
-    feature_cols = [c for c in df.columns if c not in NON_FEATURE]
-
-    bundle: dict = {}
-    for pos in ["GK", "DEF", "MID", "FWD"]:
-        sub = df[df["position"] == pos].copy()
-        if len(sub) < 50:
-            continue
-
-        bundle[pos] = {}
-        log.info(f"Training {pos}...")
-
-        for target in TRAIN_TARGETS:
-            if target not in sub.columns:
-                continue
-            y = sub[target].fillna(0)
-            if y.sum() == 0:
-                continue
-
-            X = sub[feature_cols].fillna(0)
-
-            # Use last time-series split to find best n_estimators via early stopping
-            tscv  = TimeSeriesSplit(n_splits=3)
-            tr, te = list(tscv.split(X))[-1]
-
-            params = dict(
-                n_estimators=2000,
-                learning_rate=0.02,
-                num_leaves=31,
-                min_child_samples=20,
-                subsample=0.8,
-                colsample_bytree=0.7,
-                reg_alpha=0.1,
-                reg_lambda=0.5,
-                verbose=-1,
-                random_state=42,
-            )
-            m_cv = LGBMRegressor(**params)
-            m_cv.fit(
-                X.iloc[tr], y.iloc[tr],
-                eval_set=[(X.iloc[te], y.iloc[te])],
-                callbacks=[lgb_early_stopping(50, verbose=False)],
-            )
-            best_n = m_cv.best_iteration_ or 300
-
-            # Final model trained on all data with tuned n_estimators
-            m = LGBMRegressor(**{**params, "n_estimators": best_n})
-            m.fit(X, y)
-            bundle[pos][target] = m
-
-    return bundle, feature_cols
-
-
-# ============================================================================
 # PREDICTION  +  FULL SLEEPER SCORING
 # ============================================================================
 
-def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
+def predict_next_gw(df: pd.DataFrame,
                     ts: pd.DataFrame, fixtures: list, boot: dict) -> pd.DataFrame:
     next_gw = int(df["GW"].max()) + 1
     base = df.sort_values("GW").groupby("name").tail(1).copy()
@@ -639,158 +634,129 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
         norm = _norm_name(player_name)
         return sleeper_hist.get(norm) or fpl_last5.get(player_name, 0.0)
 
-    fbref_stats: dict = {}  # FBref removed (403 blocked); Sleeper API used instead
+    understat_xg = load_understat_xg()
+    log.info(f"Understat xG/xA loaded for {len(understat_xg)} players")
+
+    GOAL_CAPS    = {"GK": 0.03, "DEF": 0.12, "MID": 0.40, "FWD": 0.80}
+    ASSIST_CAPS  = {"GK": 0.02, "DEF": 0.25, "MID": 0.50, "FWD": 0.35}
+    GOAL_FLOOR   = {"GK": 0.005, "DEF": 0.01, "MID": 0.03, "FWD": 0.05}
+    ASSIST_FLOOR = {"GK": 0.005, "DEF": 0.02, "MID": 0.04, "FWD": 0.04}
 
     rows = []
     for _, row in base.iterrows():
         pos = row["position"]
-        if pos not in bundle:
+        if pos not in ("GK", "DEF", "MID", "FWD"):
             continue
 
-        # Availability: only zero out confirmed out (injured/suspended/0% chance).
-        # Doubtful players keep full predicted pts — availability is display-only info.
         status = row.get("status", "a")
         chance = float(row.get("chance_of_playing", 100))
         avail_mult = 0.0 if (status in ("i", "s") or chance == 0) else 1.0
 
-        x = row[feature_cols].fillna(0).to_frame().T.astype(float)
-
-        s: dict[str, float] = {
-            t: max(0.0, float(bundle[pos][t].predict(x)[0]))
-            for t in bundle[pos]
-        }
-
         exp_min   = float(row.get("minutes_avg5", 60))
         min_scale = min(1.0, exp_min / 90)
 
-        def sc(stat: str) -> float:
-            return s.get(stat, 0.0) * min_scale
-
-        # ── Fixture-difficulty + opponent-quality adjustments ─────────────────
+        # ── Fixture adjustments ───────────────────────────────────────────────
         fdr    = int(row.get("fdr", 3))
         opp_gs = max(0.3, float(row.get("opp_gs_avg5", 1.3)))
         opp_gc = max(0.3, float(row.get("opp_gc_avg5", 1.3)))
 
-        fdr_att = {1: 1.6, 2: 1.3, 3: 1.0, 4: 0.72, 5: 0.48}[fdr]
+        fdr_att        = {1: 1.6, 2: 1.3, 3: 1.0, 4: 0.72, 5: 0.48}[fdr]
         opp_def_factor = min(1.6, max(0.5, opp_gc / 1.3))
-        att_mult = fdr_att * opp_def_factor
-
-        fdr_def = {1: 0.65, 2: 0.82, 3: 1.0, 4: 1.25, 5: 1.55}[fdr]
-
-        # Physical maxima by position
-        GOAL_CAPS   = {"GK": 0.03, "DEF": 0.12, "MID": 0.40, "FWD": 0.80}
-        ASSIST_CAPS = {"GK": 0.02, "DEF": 0.25, "MID": 0.50, "FWD": 0.35}
-
-        # Position floors so the model never shows exactly 0 — even defensive
-        # midfielders have some chance of contributing offensively
-        GOAL_FLOOR   = {"GK": 0.005, "DEF": 0.01,  "MID": 0.03,  "FWD": 0.05}
-        ASSIST_FLOOR = {"GK": 0.005, "DEF": 0.02,  "MID": 0.04,  "FWD": 0.04}
-
-        adj_goals   = min(
-            max(s.get("goals_scored", 0) * att_mult, GOAL_FLOOR[pos]) * min_scale,
-            GOAL_CAPS[pos] * min_scale,
-        )
-        adj_assists = min(
-            max(s.get("assists", 0) * att_mult, ASSIST_FLOOR[pos]) * min_scale,
-            ASSIST_CAPS[pos] * min_scale,
-        )
-        adj_saves   = s.get("saves",          0) * fdr_def * min_scale
-        adj_gc      = s.get("goals_conceded", 0) * fdr_def * min_scale
+        att_mult       = fdr_att * opp_def_factor
+        fdr_def        = {1: 0.65, 2: 0.82, 3: 1.0, 4: 1.25, 5: 1.55}[fdr]
+        is_home        = int(row.get("was_home", 1))
+        ha_mult        = 1.08 if is_home else 0.93
 
         # Poisson clean sheet: P(CS) = e^(-λ)
-        lambda_opp = opp_gs * fdr_def
+        lambda_opp = opp_gs * fdr_def * ha_mult
         prob_cs    = float(np.exp(-lambda_opp)) if exp_min >= 60 else 0.0
         prob_cs    = min(0.85, prob_cs)
 
-        # ── Sleeper per-90 stats (real Opta data) with ICT fallback ─────────────
-        slp_key = _norm_name(str(row["name"]))
-        sp = sleeper_per90.get(slp_key) or \
-             sleeper_per90.get(_norm_name(str(row.get("display_name", "")))) or {}
-
-        thr = float(row.get("threat_avg5",     0))
-        cre = float(row.get("creativity_avg5", 0))
-        inf = float(row.get("influence_avg5",  0))
-
-        # ICT fallback base rates (used only when Sleeper per-90 unavailable)
-        if pos == "GK":
-            ict_sot, ict_kp, ict_crs, ict_drb = 0.0, 0.0, cre/50, 0.0
-            ict_tkl, ict_int, ict_blk, ict_clr, ict_aer = inf/80, inf/90, 0.0, inf/12, inf/8
-        elif pos == "DEF":
-            ict_sot, ict_kp, ict_crs, ict_drb = thr/30, cre/25, cre/18, cre/22
-            ict_tkl, ict_int, ict_blk, ict_clr, ict_aer = inf/18, inf/22, inf/28, inf/10, inf/12
-        elif pos == "MID":
-            ict_sot, ict_kp, ict_crs, ict_drb = thr/18, cre/22, cre/22, cre/25
-            ict_tkl, ict_int, ict_blk, ict_clr, ict_aer = inf/25, inf/30, inf/30, inf/28, inf/18
-        else:
-            ict_sot, ict_kp, ict_crs, ict_drb = thr/18, cre/28, cre/25, cre/20
-            ict_tkl, ict_int, ict_blk, ict_clr, ict_aer = inf/55, inf/65, inf/55, 0.0, inf/14
-
-        # Use Sleeper real per-90 where available, else ICT
-        est_sot = sp.get("sot",  ict_sot)
-        est_kp  = sp.get("kp",   ict_kp)
-        est_crs = sp.get("acnc", ict_crs)
-        est_drb = sp.get("drb",  ict_drb)
-        # Sleeper EPL doesn't track tkl separately — use int as defensive proxy
-        slp_int = sp.get("int",  None)
-        est_tkl = (slp_int * 0.5) if slp_int is not None else ict_tkl
-        est_int = (slp_int * 0.5) if slp_int is not None else ict_int
-        est_blk = ict_blk  # not in Sleeper EPL data
-        est_clr = sp.get("clr", ict_clr)
-        est_aer = sp.get("aer", ict_aer)
-        if pos == "GK" and "svs" in sp:
-            adj_saves = sp["svs"] * fdr_def * min_scale
-
-        # ── Apply FDR uniformly ───────────────────────────────────────────────
-        est_sot *= att_mult;  est_kp  *= att_mult
-        est_crs *= att_mult;  est_drb *= att_mult
-        est_tkl *= fdr_def;   est_int *= fdr_def
-        est_blk *= fdr_def;   est_clr *= fdr_def
-
-        # Form indicator: compare last-3 avg points vs last-10 avg
+        # Form indicator (FPL rolling avg — display only)
         pts3  = float(row.get("total_points_avg3",  0))
         pts10 = float(row.get("total_points_avg10", 0))
+        form  = "~"
         if pts10 > 0.5:
             ratio = pts3 / pts10
             form  = "🔥" if ratio >= 1.3 else ("❄️" if ratio <= 0.7 else "~")
-        else:
-            form = "~"
 
-        # Full Sleeper point formula
-        pts = (
-            adj_goals                * _pos_score("goals", pos)
-          + adj_assists              * _pos_score("assists", pos)
-          + adj_saves                * SLEEPER_SCORING["saves"]
-          + adj_gc                   * _pos_score("goals_against", pos)
-          + sc("own_goals")          * SLEEPER_SCORING["own_goals"]
-          + sc("penalties_missed")   * SLEEPER_SCORING["penalties_missed"]
-          + sc("penalties_saved")    * SLEEPER_SCORING["penalties_saved"]
-          + sc("yellow_cards")       * SLEEPER_SCORING["yellow_card"]
-          + sc("red_cards")          * SLEEPER_SCORING["red_card"]
-          + prob_cs                  * _pos_score("clean_sheet_60plus", pos)
-          # ICT-derived (FDR already applied to est_ values above)
-          + est_sot * min_scale * SLEEPER_SCORING["shots_on_target"]
-          + est_kp  * min_scale * _pos_score("key_passes", pos)
-          + est_crs * min_scale * SLEEPER_SCORING["accurate_crosses"]
-          + est_drb * min_scale * SLEEPER_SCORING["successful_dribbles"]
-          + est_tkl * min_scale * SLEEPER_SCORING["tackles_won"]
-          + est_int * min_scale * SLEEPER_SCORING["interceptions"]
-          + est_blk * min_scale * SLEEPER_SCORING["blocked_shots"]
-          + est_clr * min_scale * _pos_score("effective_clearances", pos)
-          + est_aer * min_scale * _pos_score("aerials_won", pos)
-        )
-
-        # Blend stat projection with historical Sleeper average.
-        # pts_std from the Sleeper API is the ground truth anchor.
-        # Home advantage: ~8% boost at home, ~7% cut away (PL average).
+        # ── Stat sources ──────────────────────────────────────────────────────
+        slp_key = _norm_name(str(row["name"]))
+        alt_key = _norm_name(str(row.get("display_name", "")))
+        sp = sleeper_per90.get(slp_key) or sleeper_per90.get(alt_key) or {}
+        us = understat_xg.get(slp_key)  or understat_xg.get(alt_key)  or {}
         avg5 = _avg5(row["name"])
-        if avg5 > 0:
-            is_home    = int(row.get("was_home", 1))
-            ha_mult    = 1.08 if is_home else 0.93
-            fixture_mult = (att_mult + fdr_def) / 2.0 * ha_mult
-            hist_pts   = avg5 * fixture_mult * min_scale
-            pts = 0.4 * pts + 0.6 * hist_pts
 
-        # Zero out confirmed absentees after blending
+        if not sp:
+            # No Sleeper per-90 data — fall back to fixture-adjusted historical avg
+            fixture_mult = (att_mult + fdr_def) / 2.0 * ha_mult
+            pts = avg5 * fixture_mult * min_scale
+            adj_goals = adj_assists = est_sot = est_kp = 0.0
+            est_tkl = est_int = adj_saves = 0.0
+            prob_cs_out = 0.0
+        else:
+            # Goals: blend Sleeper gs_per90 (actual) with Understat xG (expected).
+            # xG regresses lucky/unlucky periods toward true quality.
+            gs_per90  = sp.get("gs",  0.0)
+            xg_per90  = us.get("xg_per90", gs_per90)
+            raw_goals = 0.4 * gs_per90 + 0.6 * xg_per90
+            adj_goals = min(
+                max(raw_goals * att_mult * ha_mult * min_scale, GOAL_FLOOR[pos]),
+                GOAL_CAPS[pos] * min_scale,
+            )
+
+            # Assists: same blend
+            ast_per90   = sp.get("ast", 0.0)
+            xa_per90    = us.get("xa_per90", ast_per90)
+            raw_assists = 0.4 * ast_per90 + 0.6 * xa_per90
+            adj_assists = min(
+                max(raw_assists * att_mult * ha_mult * min_scale, ASSIST_FLOOR[pos]),
+                ASSIST_CAPS[pos] * min_scale,
+            )
+
+            # Attacking stats (scale with attacking fixture difficulty + H/A)
+            est_sot = sp.get("sot",  0.0) * att_mult * ha_mult * min_scale
+            est_kp  = sp.get("kp",   0.0) * att_mult * ha_mult * min_scale
+            est_crs = sp.get("acnc", 0.0) * att_mult * ha_mult * min_scale
+            est_drb = sp.get("drb",  0.0) * att_mult * ha_mult * min_scale
+
+            # Defensive stats (scale with defensive fixture difficulty + H/A)
+            slp_int = sp.get("int", 0.0)
+            est_tkl = slp_int * 0.5 * fdr_def * ha_mult * min_scale
+            est_int = slp_int * 0.5 * fdr_def * ha_mult * min_scale
+            est_clr = sp.get("clr", 0.0) * fdr_def * ha_mult * min_scale
+            est_aer = sp.get("aer", 0.0) * fdr_def * ha_mult * min_scale
+
+            # GK saves
+            adj_saves = sp.get("svs", sp.get("saves", 0.0)) * fdr_def * ha_mult * min_scale
+
+            # Goals against (GK: -1, DEF: -0.5, MID/FWD: scoring weight is 0)
+            adj_gc = sp.get("ga", 0.0) * fdr_def * ha_mult * min_scale
+
+            # Cards (intrinsic to player — no fixture scaling)
+            adj_yc = sp.get("yc", 0.0) * min_scale
+            adj_rc = sp.get("rc", 0.0) * min_scale
+
+            prob_cs_out = prob_cs
+
+            pts = (
+                adj_goals   * _pos_score("goals", pos)
+              + adj_assists * _pos_score("assists", pos)
+              + adj_saves   * SLEEPER_SCORING["saves"]
+              + adj_gc      * _pos_score("goals_against", pos)
+              + adj_yc      * SLEEPER_SCORING["yellow_card"]
+              + adj_rc      * SLEEPER_SCORING["red_card"]
+              + prob_cs     * _pos_score("clean_sheet_60plus", pos)
+              + est_sot     * SLEEPER_SCORING["shots_on_target"]
+              + est_kp      * _pos_score("key_passes", pos)
+              + est_crs     * SLEEPER_SCORING["accurate_crosses"]
+              + est_drb     * SLEEPER_SCORING["successful_dribbles"]
+              + est_tkl     * SLEEPER_SCORING["tackles_won"]
+              + est_int     * SLEEPER_SCORING["interceptions"]
+              + est_clr     * _pos_score("effective_clearances", pos)
+              + est_aer     * _pos_score("aerials_won", pos)
+            )
+
         pts *= avail_mult
 
         rows.append({
@@ -805,16 +771,16 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
             "form":         form,
             "GW":           next_gw,
             "avail":        f"{int(chance)}%" if status != "a" else "OK",
-            "avg_pts_5":    _avg5(row["name"]),
+            "avg_pts_5":    avg5,
             "exp_min":      round(exp_min, 1),
             "exp_goals":    round(adj_goals,   2),
             "exp_assists":  round(adj_assists, 2),
-            "exp_sot":      round(est_sot * min_scale, 2),
-            "exp_kp":       round(est_kp  * min_scale, 2),
-            "exp_tkl":      round(est_tkl * min_scale, 2),
-            "exp_int":      round(est_int * min_scale, 2),
+            "exp_sot":      round(est_sot,     2),
+            "exp_kp":       round(est_kp,      2),
+            "exp_tkl":      round(est_tkl,     2),
+            "exp_int":      round(est_int,     2),
             "exp_saves":    round(adj_saves,   2),
-            "exp_cs":       round(prob_cs,     2),
+            "exp_cs":       round(prob_cs_out, 2),
             "sleeper_pts":  round(pts,         2),
         })
 
@@ -1031,8 +997,7 @@ def main() -> None:
     fixtures     = fpl_client.fixtures()
     df, ts       = load_current_season_data(fpl_client, boot, fixtures)
     feat         = engineer_features(df)
-    bundle, feature_cols = train_component_models(feat)
-    predictions  = predict_next_gw(feat, bundle, feature_cols, ts, fixtures, boot)
+    predictions  = predict_next_gw(feat, ts, fixtures, boot)
     print_menu(predictions, feat)
 
 
