@@ -99,6 +99,9 @@ def _pos_score(key: str, pos: str) -> float:
 
 def _norm_name(name: str) -> str:
     """Lowercase, strip accents — for FBref↔FPL name matching."""
+    # Replace Turkish dotless-i (U+0131) before NFKD — it has no decomposition
+    # so the combining-char strip won't touch it, causing "kadıoglu" ≠ "kadioglu".
+    name = name.replace("ı", "i").replace("İ", "i")
     nfkd = unicodedata.normalize("NFKD", name.lower().strip())
     return "".join(c for c in nfkd if not unicodedata.combining(c))
 
@@ -193,7 +196,7 @@ def load_sleeper_hist_pts(
     cache_dir_p.mkdir(exist_ok=True)
     start_gw    = max(1, current_gw - n_weeks + 1)
     cache_file  = cache_dir_p / f"sleeper_hist_gw{start_gw}_{current_gw}.json"
-    per90_file  = cache_dir_p / f"sleeper_per90_v6_gw{start_gw}_{current_gw}.json"
+    per90_file  = cache_dir_p / f"sleeper_per90_v7_gw{start_gw}_{current_gw}.json"
 
     debug: list[str] = []
 
