@@ -248,7 +248,7 @@ with st.expander("🔍 Debug", expanded=False):
     # Sleeper historical stats API
     st.write("**Sleeper stats API (historical points source):**")
     _slp_cache = next(iter(sorted(_cache_dir.glob("sleeper_hist_gw*.json"))), None)
-    _slp_per90 = next(iter(sorted(_cache_dir.glob("sleeper_per90_v5_*.json"))), None)
+    _slp_per90 = next(iter(sorted(_cache_dir.glob("sleeper_per90_v6_*.json"))), None)
     _slp_keys  = _cache_dir / "sleeper_stat_keys.json"
     if _slp_cache:
         _slp_data = json.loads(_slp_cache.read_text())

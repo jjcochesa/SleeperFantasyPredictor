@@ -180,7 +180,7 @@ def load_sleeper_hist_pts(
     cache_dir: str = ".fpl_cache",
     n_weeks: int = 7,      # GWs to fetch for per-90 stat calculations
     n_avg: int = 5,        # GWs to use for the displayed avg_pts_5 column
-    min_mins: int = 30,    # Minimum minutes to include a GW in per-90 (filters cameos)
+    min_mins: int = 45,    # Minimum minutes to include a GW in per-90 (filters cameos)
 ) -> tuple[dict[str, float], dict[str, dict], list[str]]:
     """
     Fetch last n_weeks of stats from Sleeper API.
@@ -193,7 +193,7 @@ def load_sleeper_hist_pts(
     cache_dir_p.mkdir(exist_ok=True)
     start_gw    = max(1, current_gw - n_weeks + 1)
     cache_file  = cache_dir_p / f"sleeper_hist_gw{start_gw}_{current_gw}.json"
-    per90_file  = cache_dir_p / f"sleeper_per90_v5_gw{start_gw}_{current_gw}.json"
+    per90_file  = cache_dir_p / f"sleeper_per90_v6_gw{start_gw}_{current_gw}.json"
 
     debug: list[str] = []
 
