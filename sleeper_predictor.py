@@ -783,6 +783,15 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
           + est_aer * min_scale * _pos_score("aerials_won", pos)
         ) * avail_mult
 
+        # Blend stat projection with historical Sleeper average.
+        # Per-stat projections systematically underestimate high-variance players;
+        # pts_std from the Sleeper API is the ground truth anchor.
+        avg5 = _avg5(row["name"])
+        if avg5 > 0 and avail_mult > 0:
+            fixture_mult = (att_mult + fdr_def) / 2.0
+            hist_pts = avg5 * fixture_mult * min_scale * avail_mult
+            pts = 0.4 * pts + 0.6 * hist_pts
+
         rows.append({
             "name":         row["name"],
             "display_name": row.get("display_name", row["name"]),
