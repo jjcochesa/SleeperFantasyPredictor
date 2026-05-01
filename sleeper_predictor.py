@@ -55,10 +55,15 @@ SLEEPER_SCORING = {
     "interceptions":        1.0,
     "blocked_shots":        1.0,
     "goals_against":        {"FWD": 0,    "MID": 0,    "DEF": -2,   "GK": -2},
-    # FPL API available
     "own_goals":            -5.0,
     "penalties_missed":     -4.0,
     "penalties_saved":       8.0,
+    # Additional Sleeper scoring categories
+    "smothers":             1.0,
+    "high_claims":          1.0,
+    "dispossessed":        -0.5,
+    "penalty_kicks_drawn":  2.0,
+    "second_yellow":       -5.0,
 }
 
 
@@ -186,7 +191,7 @@ def load_sleeper_hist_pts(
     cache_dir_p.mkdir(exist_ok=True)
     start_gw    = max(1, current_gw - n_weeks + 1)
     cache_file  = cache_dir_p / f"sleeper_hist_gw{start_gw}_{current_gw}.json"
-    per90_file  = cache_dir_p / f"sleeper_per90_gw{start_gw}_{current_gw}.json"
+    per90_file  = cache_dir_p / f"sleeper_per90_v2_gw{start_gw}_{current_gw}.json"
 
     debug: list[str] = []
 
@@ -201,6 +206,7 @@ def load_sleeper_hist_pts(
 
     player_pts:   dict[str, list[float]] = {}  # norm_name -> [pts per gw]
     player_stats: dict[str, list[dict]]  = {}  # norm_name -> [stats dict per gw]
+    all_seen_keys: set[str] = set()            # for diagnostic
 
     for gw in range(max(1, current_gw - n_weeks + 1), current_gw + 1):
         url = f"{SLEEPER_API}/stats/{sport}/regular/{year}/{gw}"
@@ -215,28 +221,41 @@ def load_sleeper_hist_pts(
             for pid, stats in week_stats.items():
                 if not isinstance(stats, dict):
                     continue
+                # Collect all non-zero field names for diagnostics
+                all_seen_keys.update(k for k, v in stats.items() if v)
                 norm = _norm_name(name_map.get(str(pid), ""))
                 if not norm:
                     continue
-                # Use Sleeper's own pre-calculated points (pts_std)
                 pts = float(stats.get("pts_std", 0.0))
                 player_pts.setdefault(norm, []).append(pts)
                 player_stats.setdefault(norm, []).append(stats)
         except Exception as e:
             debug.append(f"  GW{gw}: error — {e}")
 
+    # Save all observed field names for debugging in the UI
+    if all_seen_keys:
+        (cache_dir_p / "sleeper_stat_keys.json").write_text(
+            json.dumps(sorted(all_seen_keys))
+        )
+
     avg_pts = {name: round(sum(pts) / len(pts), 1)
                for name, pts in player_pts.items() if pts}
 
-    # Compute per-90 averages from season stats (for projection model)
+    # Compute per-90 averages — include every stat Sleeper scores
     per90: dict[str, dict] = {}
     _per90_keys = [
         "gs", "ast", "asts",           # goals, assists
         "sot", "kp", "acnc", "drb",    # attacking
-        "int", "clr", "aer",           # defensive
-        "svs", "saves",                # GK saves
+        "int", "clr", "aer", "blk",    # defensive + blocked shots
+        "svs", "sv",                   # GK saves (try both field names)
         "yc", "rc",                    # cards
-        "ga",                          # goals against
+        "ga",                          # goals against (GK/DEF)
+        "dis",                         # dispossessed
+        "smo",                         # smothers
+        "hcs",                         # high claims succeeded
+        "pkd",                         # penalty kicks drawn
+        "yc2",                         # 2nd yellow card
+        "ps",                          # penalty kick saves
     ]
     for norm, gw_list in player_stats.items():
         totals: dict[str, float] = {}
@@ -248,8 +267,10 @@ def load_sleeper_hist_pts(
         if total_min >= 90:
             n90 = total_min / 90
             p90 = {k: round(v / n90, 3) for k, v in totals.items()}
-            # Normalise assist field — Sleeper uses either "ast" or "asts"
+            # Normalise assist field — Sleeper uses "ast" or "asts"
             p90["ast"] = max(p90.get("ast", 0.0), p90.get("asts", 0.0))
+            # Normalise saves field — try svs first, fall back to sv
+            p90["svs"] = max(p90.get("svs", 0.0), p90.get("sv", 0.0))
             per90[norm] = p90
 
     cache_file.write_text(json.dumps(avg_pts))
@@ -727,15 +748,26 @@ def predict_next_gw(df: pd.DataFrame,
             est_clr = sp.get("clr", 0.0) * fdr_def * ha_mult * min_scale
             est_aer = sp.get("aer", 0.0) * fdr_def * ha_mult * min_scale
 
-            # GK saves
-            adj_saves = sp.get("svs", sp.get("saves", 0.0)) * fdr_def * ha_mult * min_scale
+            # GK saves (svs already normalised in load_sleeper_hist_pts)
+            adj_saves = sp.get("svs", 0.0) * fdr_def * ha_mult * min_scale
 
-            # Goals against (GK: -1, DEF: -0.5, MID/FWD: scoring weight is 0)
+            # Blocked shots
+            est_blk = sp.get("blk", 0.0) * fdr_def * ha_mult * min_scale
+
+            # Goals against (GK: -2, DEF: -2, MID/FWD: scoring weight is 0)
             adj_gc = sp.get("ga", 0.0) * fdr_def * ha_mult * min_scale
 
-            # Cards (intrinsic to player — no fixture scaling)
-            adj_yc = sp.get("yc", 0.0) * min_scale
-            adj_rc = sp.get("rc", 0.0) * min_scale
+            # Cards (intrinsic — no fixture scaling)
+            adj_yc  = sp.get("yc",  0.0) * min_scale
+            adj_rc  = sp.get("rc",  0.0) * min_scale
+            adj_yc2 = sp.get("yc2", 0.0) * min_scale
+
+            # Other Sleeper scoring stats (intrinsic to player style)
+            adj_smo = sp.get("smo", 0.0) * min_scale  # smothers
+            adj_hcs = sp.get("hcs", 0.0) * min_scale  # high claims
+            adj_dis = sp.get("dis", 0.0) * min_scale  # dispossessed
+            adj_pkd = sp.get("pkd", 0.0) * min_scale  # penalty kicks drawn
+            adj_ps  = sp.get("ps",  0.0) * min_scale  # penalty kick saves
 
             prob_cs_out = prob_cs
 
@@ -746,6 +778,7 @@ def predict_next_gw(df: pd.DataFrame,
               + adj_gc      * _pos_score("goals_against", pos)
               + adj_yc      * SLEEPER_SCORING["yellow_card"]
               + adj_rc      * SLEEPER_SCORING["red_card"]
+              + adj_yc2     * SLEEPER_SCORING["second_yellow"]
               + prob_cs     * _pos_score("clean_sheet_60plus", pos)
               + est_sot     * SLEEPER_SCORING["shots_on_target"]
               + est_kp      * _pos_score("key_passes", pos)
@@ -753,8 +786,14 @@ def predict_next_gw(df: pd.DataFrame,
               + est_drb     * SLEEPER_SCORING["successful_dribbles"]
               + est_tkl     * SLEEPER_SCORING["tackles_won"]
               + est_int     * SLEEPER_SCORING["interceptions"]
+              + est_blk     * SLEEPER_SCORING["blocked_shots"]
               + est_clr     * _pos_score("effective_clearances", pos)
               + est_aer     * _pos_score("aerials_won", pos)
+              + adj_smo     * SLEEPER_SCORING["smothers"]
+              + adj_hcs     * SLEEPER_SCORING["high_claims"]
+              + adj_dis     * SLEEPER_SCORING["dispossessed"]
+              + adj_pkd     * SLEEPER_SCORING["penalty_kicks_drawn"]
+              + adj_ps      * SLEEPER_SCORING["penalties_saved"]
             )
 
         pts *= avail_mult

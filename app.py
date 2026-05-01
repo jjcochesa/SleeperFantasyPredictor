@@ -248,12 +248,20 @@ with st.expander("🔍 Debug", expanded=False):
     # Sleeper historical stats API
     st.write("**Sleeper stats API (historical points source):**")
     _slp_cache = next(iter(sorted(_cache_dir.glob("sleeper_hist_gw*.json"))), None)
+    _slp_per90 = next(iter(sorted(_cache_dir.glob("sleeper_per90_v2_*.json"))), None)
     _slp_keys  = _cache_dir / "sleeper_stat_keys.json"
     if _slp_cache:
         _slp_data = json.loads(_slp_cache.read_text())
         st.write(f"  ✅ {len(_slp_data)} players with Sleeper hist pts ({_slp_cache.stem})")
+        if _slp_per90:
+            _per90_data = json.loads(_slp_per90.read_text())
+            # Show a GK's per-90 data to verify save field
+            gk_sample = {k: v for k, v in list(_per90_data.items())[:3]}
+            st.write(f"  Per-90 cache: {len(_per90_data)} players")
+            st.write("  Sample per-90 (first 3 players):")
+            st.json(gk_sample)
         if _slp_keys.exists():
-            st.write("  Stat fields returned by Sleeper API:")
+            st.write("  All Sleeper API stat fields observed:")
             st.code(", ".join(json.loads(_slp_keys.read_text())))
     else:
         st.write("  ❌ Not fetched yet — click Refresh Predictions")
