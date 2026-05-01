@@ -210,7 +210,7 @@ def load_sleeper_hist_pts(
     player_pts:   dict[str, list[float]] = {}  # norm_name -> [pts per gw]
     player_stats: dict[str, list[dict]]  = {}  # norm_name -> [stats dict per gw]
 
-    for gw in range(max(1, current_gw - n_weeks), current_gw):
+    for gw in range(max(1, current_gw - n_weeks + 1), current_gw + 1):
         url = f"{SLEEPER_API}/stats/{sport}/regular/{year}/{gw}"
         try:
             r = requests.get(url, timeout=15)
@@ -238,7 +238,7 @@ def load_sleeper_hist_pts(
 
     # Compute per-90 averages from season stats (for projection model)
     per90: dict[str, dict] = {}
-    _per90_keys = ["sot", "kp", "acnc", "drb", "tkl", "int", "blk", "clr", "aer", "svs", "saves"]
+    _per90_keys = ["sot", "kp", "acnc", "drb", "int", "clr", "aer", "svs", "saves"]
     for norm, gw_list in player_stats.items():
         totals = {}
         total_min = 0.0
@@ -720,15 +720,17 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
             ict_tkl, ict_int, ict_blk, ict_clr, ict_aer = inf/55, inf/65, inf/55, 0.0, inf/14
 
         # Use Sleeper real per-90 where available, else ICT
-        est_sot = sp.get("sot",   ict_sot)
-        est_kp  = sp.get("kp",    ict_kp)
-        est_crs = sp.get("acnc",  ict_crs)
-        est_drb = sp.get("drb",   ict_drb)
-        est_tkl = sp.get("tkl",   ict_tkl)
-        est_int = sp.get("int",   ict_int)
-        est_blk = sp.get("blk",   ict_blk)
-        est_clr = sp.get("clr",   ict_clr)
-        est_aer = sp.get("aer",   ict_aer)
+        est_sot = sp.get("sot",  ict_sot)
+        est_kp  = sp.get("kp",   ict_kp)
+        est_crs = sp.get("acnc", ict_crs)
+        est_drb = sp.get("drb",  ict_drb)
+        # Sleeper EPL doesn't track tkl separately — use int as defensive proxy
+        slp_int = sp.get("int",  None)
+        est_tkl = (slp_int * 0.5) if slp_int is not None else ict_tkl
+        est_int = (slp_int * 0.5) if slp_int is not None else ict_int
+        est_blk = ict_blk  # not in Sleeper EPL data
+        est_clr = sp.get("clr", ict_clr)
+        est_aer = sp.get("aer", ict_aer)
         if pos == "GK" and "svs" in sp:
             adj_saves = sp["svs"] * fdr_def * min_scale
 
