@@ -464,17 +464,52 @@ def load_fpl_data(client: FPLDataClient, boot: dict) -> pd.DataFrame:
     return df
 
 
-def build_team_gw_stats(df: pd.DataFrame) -> pd.DataFrame:
-    gk = df[df["position"] == "GK"]
-    def_stats = gk.groupby(["team", "GW"]).agg(
-        team_goals_conceded=("goals_conceded", "first"),
-        team_xg_conceded=("expected_goals_conceded", "first"),
-    ).reset_index()
-    att_stats = df.groupby(["team", "GW"]).agg(
-        team_goals_scored=("goals_scored", "sum"),
-        team_xg_scored=("expected_goals", "sum"),
-    ).reset_index()
-    ts = att_stats.merge(def_stats, on=["team", "GW"], how="left").sort_values(["team", "GW"])
+def build_team_gw_stats(df: pd.DataFrame,
+                        fixtures: list | None = None,
+                        boot: dict | None = None) -> pd.DataFrame:
+    # Use fixture scores for goals — reliable even when GKs miss games (e.g. Wolves/Sá).
+    # GK-based goals_conceded creates gaps in injured-GK weeks → rolling avg collapses.
+    if fixtures and boot:
+        tid2name = {t["id"]: t["short_name"] for t in boot["teams"]}
+        fix_rows = []
+        for f in fixtures:
+            if not f.get("finished") or not f.get("event"):
+                continue
+            h = tid2name.get(f["team_h"], "")
+            a = tid2name.get(f["team_a"], "")
+            hs = int(f.get("team_h_score") or 0)
+            as_ = int(f.get("team_a_score") or 0)
+            if h:
+                fix_rows.append({"team": h, "GW": f["event"],
+                                  "team_goals_scored": hs, "team_goals_conceded": as_})
+            if a:
+                fix_rows.append({"team": a, "GW": f["event"],
+                                  "team_goals_scored": as_, "team_goals_conceded": hs})
+        fix_df = pd.DataFrame(fix_rows).sort_values(["team", "GW"])
+        # xG still comes from FPL player data (not in fixtures API)
+        gk = df[df["position"] == "GK"]
+        xg_stats = gk.groupby(["team", "GW"]).agg(
+            team_xg_conceded=("expected_goals_conceded", "first"),
+        ).reset_index()
+        xg_att = df.groupby(["team", "GW"]).agg(
+            team_xg_scored=("expected_goals", "sum"),
+        ).reset_index()
+        ts = fix_df.merge(xg_stats, on=["team", "GW"], how="left")
+        ts = ts.merge(xg_att,   on=["team", "GW"], how="left")
+    else:
+        # Fallback to GK-based (less reliable for teams with GK injuries)
+        gk = df[df["position"] == "GK"]
+        def_stats = gk.groupby(["team", "GW"]).agg(
+            team_goals_conceded=("goals_conceded", "first"),
+            team_xg_conceded=("expected_goals_conceded", "first"),
+        ).reset_index()
+        att_stats = df.groupby(["team", "GW"]).agg(
+            team_goals_scored=("goals_scored", "sum"),
+            team_xg_scored=("expected_goals", "sum"),
+        ).reset_index()
+        ts = att_stats.merge(def_stats, on=["team", "GW"], how="left")
+
+    ts = ts.sort_values(["team", "GW"])
     for w in [3, 5]:
         for col in ["team_goals_conceded", "team_xg_conceded", "team_goals_scored", "team_xg_scored"]:
             if col in ts.columns:
@@ -527,7 +562,7 @@ def load_current_season_data(
     fixtures: list,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     df = load_fpl_data(fpl_client, boot)
-    ts = build_team_gw_stats(df)
+    ts = build_team_gw_stats(df, fixtures=fixtures, boot=boot)
     df = enrich_with_fixture_context(df, ts, fixtures, boot)
     return df, ts
 
