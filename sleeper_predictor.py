@@ -113,28 +113,28 @@ def _norm_name(name: str) -> str:
 
 SLEEPER_API = "https://api.sleeper.app/v1"
 
-# Mapping from our SLEEPER_SCORING keys → Sleeper API stat field names
+# Sleeper API stat field names (from api.sleeper.app/v1/stats/clubsoccer:epl)
 _SLEEPER_FIELD = {
-    "goals":                ["gls", "goals_scored", "goals"],
-    "assists":              ["asts", "assists"],
-    "shots_on_target":      ["sog", "shots_on_target", "sot"],
-    "key_passes":           ["kp",  "key_passes"],
-    "successful_dribbles":  ["drb", "successful_dribbles", "dribbles"],
-    "accurate_crosses":     ["crs", "accurate_crosses", "crosses"],
-    "aerials_won":          ["aer", "aerials_won", "aerial_won"],
-    "effective_clearances": ["clr", "effective_clearances", "clearances"],
+    "goals":                ["gs"],
+    "assists":              ["ast", "asts"],
+    "shots_on_target":      ["sot"],
+    "key_passes":           ["kp"],
+    "successful_dribbles":  ["drb"],
+    "accurate_crosses":     ["acnc"],
+    "aerials_won":          ["aer"],
+    "effective_clearances": ["clr"],
     "saves":                ["svs", "saves"],
-    "clean_sheets":         ["cs",  "clean_sheets"],
-    "tackles_won":          ["tkl", "tackles_won", "tackles"],
-    "interceptions":        ["int", "interceptions"],
-    "blocked_shots":        ["blk", "blocked_shots", "blocks"],
-    "goals_against":        ["gc",  "goals_conceded", "goals_against"],
-    "own_goals":            ["og",  "own_goals"],
-    "penalties_missed":     ["pm",  "penalties_missed"],
-    "penalties_saved":      ["ps",  "penalties_saved"],
-    "yellow_card":          ["yc",  "yellow_cards", "yellow_card"],
-    "red_card":             ["rc",  "red_cards", "red_card"],
-    "minutes":              ["mins","minutes_played", "minutes"],
+    "clean_sheets":         ["cos"],
+    "tackles_won":          ["tkl"],
+    "interceptions":        ["int"],
+    "blocked_shots":        ["blk"],
+    "goals_against":        ["ga"],
+    "own_goals":            ["og"],
+    "penalties_missed":     ["pm"],
+    "penalties_saved":      ["ps"],
+    "yellow_card":          ["yc"],
+    "red_card":             ["rc"],
+    "minutes":              ["min"],
 }
 
 
@@ -183,67 +183,77 @@ def load_sleeper_hist_pts(
     sport: str = "clubsoccer:epl",
     cache_dir: str = ".fpl_cache",
     n_weeks: int = 5,
-) -> tuple[dict[str, float], list[str]]:
+) -> tuple[dict[str, float], dict[str, dict], list[str]]:
     """
     Fetch last n_weeks of stats from Sleeper API.
-    Returns ({norm_player_name: avg_sleeper_pts}, [debug_lines]).
-    pos_map: {norm_player_name: position}
+    Returns:
+      - {norm_name: avg_sleeper_pts}   — uses pts_std directly from Sleeper
+      - {norm_name: {stat: per90}}     — per-90 averages for projection model
+      - [debug_lines]
     """
     cache_dir_p = Path(cache_dir)
     cache_dir_p.mkdir(exist_ok=True)
     cache_file  = cache_dir_p / f"sleeper_hist_gw{current_gw}.json"
+    per90_file  = cache_dir_p / f"sleeper_per90_gw{current_gw}.json"
 
     debug: list[str] = []
 
-    if cache_file.exists() and (time.time() - cache_file.stat().st_mtime) < 3600:
-        data = json.loads(cache_file.read_text())
+    if (cache_file.exists() and per90_file.exists() and
+            (time.time() - cache_file.stat().st_mtime) < 3600):
         debug.append("  ✅ Loaded from cache")
-        return data, debug
+        return (json.loads(cache_file.read_text()),
+                json.loads(per90_file.read_text()),
+                debug)
 
-    year     = _sleeper_season_year()
-    # Reverse name_map: norm_name -> player_id
-    norm2id  = {_norm_name(name): pid for pid, name in name_map.items()}
+    year = _sleeper_season_year()
 
-    player_pts: dict[str, list[float]] = {}
-    stat_keys_sample: list[str] = []
+    player_pts:   dict[str, list[float]] = {}  # norm_name -> [pts per gw]
+    player_stats: dict[str, list[dict]]  = {}  # norm_name -> [stats dict per gw]
 
     for gw in range(max(1, current_gw - n_weeks), current_gw):
         url = f"{SLEEPER_API}/stats/{sport}/regular/{year}/{gw}"
         try:
             r = requests.get(url, timeout=15)
-            debug.append(f"  GW{gw}: {url} → {r.status_code}")
+            debug.append(f"  GW{gw}: {r.status_code}")
             if r.status_code != 200:
                 continue
             week_stats = r.json()
             if not week_stats:
-                debug.append(f"    (empty response)")
                 continue
-
-            # Capture stat field names from first player for debug
-            if not stat_keys_sample:
-                first = next(iter(week_stats.values()))
-                stat_keys_sample = sorted(first.keys()) if isinstance(first, dict) else []
-
             for pid, stats in week_stats.items():
                 if not isinstance(stats, dict):
                     continue
                 norm = _norm_name(name_map.get(str(pid), ""))
                 if not norm:
                     continue
-                pos = pos_map.get(norm, "MID")
-                pts = _sleeper_pts_from_api(stats, pos)
+                # Use Sleeper's own pre-calculated points (pts_std)
+                pts = float(stats.get("pts_std", 0.0))
                 player_pts.setdefault(norm, []).append(pts)
-
+                player_stats.setdefault(norm, []).append(stats)
         except Exception as e:
             debug.append(f"  GW{gw}: error — {e}")
 
-    result = {name: round(sum(pts) / len(pts), 1)
-              for name, pts in player_pts.items() if pts}
+    avg_pts = {name: round(sum(pts) / len(pts), 1)
+               for name, pts in player_pts.items() if pts}
 
-    cache_file.write_text(json.dumps(result))
-    debug.append(f"  ✅ {len(result)} players with historical pts")
-    debug.append(f"  Stat fields from API: {stat_keys_sample[:20]}")
-    return result, debug
+    # Compute per-90 averages from season stats (for projection model)
+    per90: dict[str, dict] = {}
+    _per90_keys = ["sot", "kp", "acnc", "drb", "tkl", "int", "blk", "clr", "aer", "svs", "saves"]
+    for norm, gw_list in player_stats.items():
+        totals = {}
+        total_min = 0.0
+        for s in gw_list:
+            total_min += float(s.get("min", 0) or 0)
+            for k in _per90_keys:
+                totals[k] = totals.get(k, 0.0) + float(s.get(k, 0) or 0)
+        if total_min >= 90:
+            n90 = total_min / 90
+            per90[norm] = {k: round(v / n90, 3) for k, v in totals.items()}
+
+    cache_file.write_text(json.dumps(avg_pts))
+    per90_file.write_text(json.dumps(per90))
+    debug.append(f"  ✅ {len(avg_pts)} players with historical pts, {len(per90)} with per-90 stats")
+    return avg_pts, per90, debug
 
 
 # ============================================================================
@@ -610,7 +620,7 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
     except Exception:
         _name_map = {}
 
-    sleeper_hist, _slp_debug = load_sleeper_hist_pts(
+    sleeper_hist, sleeper_per90, _slp_debug = load_sleeper_hist_pts(
         current_gw=next_gw - 1,
         name_map=_name_map,
         pos_map=pos_map,
@@ -686,59 +696,47 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
         prob_cs    = float(np.exp(-lambda_opp)) if exp_min >= 60 else 0.0
         prob_cs    = min(0.85, prob_cs)
 
-        # ── ICT raw (no FDR yet) — used as fallback when FBref is missing ────
+        # ── Sleeper per-90 stats (real Opta data) with ICT fallback ─────────────
+        slp_key = _norm_name(str(row["name"]))
+        sp = sleeper_per90.get(slp_key) or \
+             sleeper_per90.get(_norm_name(str(row.get("display_name", "")))) or {}
+
         thr = float(row.get("threat_avg5",     0))
         cre = float(row.get("creativity_avg5", 0))
         inf = float(row.get("influence_avg5",  0))
 
+        # ICT fallback base rates (used only when Sleeper per-90 unavailable)
         if pos == "GK":
-            est_sot, est_kp, est_crs, est_drb = 0.0, 0.0, cre/50, 0.0
-            est_tkl, est_int, est_blk, est_clr, est_aer = inf/80, inf/90, 0.0, inf/12, inf/8
+            ict_sot, ict_kp, ict_crs, ict_drb = 0.0, 0.0, cre/50, 0.0
+            ict_tkl, ict_int, ict_blk, ict_clr, ict_aer = inf/80, inf/90, 0.0, inf/12, inf/8
         elif pos == "DEF":
-            est_sot, est_kp, est_crs, est_drb = thr/30, cre/25, cre/18, cre/22
-            est_tkl, est_int, est_blk, est_clr, est_aer = inf/18, inf/22, inf/28, inf/10, inf/12
+            ict_sot, ict_kp, ict_crs, ict_drb = thr/30, cre/25, cre/18, cre/22
+            ict_tkl, ict_int, ict_blk, ict_clr, ict_aer = inf/18, inf/22, inf/28, inf/10, inf/12
         elif pos == "MID":
-            est_sot, est_kp, est_crs, est_drb = thr/18, cre/22, cre/22, cre/25
-            est_tkl, est_int, est_blk, est_clr, est_aer = inf/25, inf/30, inf/30, inf/28, inf/18
-        else:  # FWD
-            est_sot, est_kp, est_crs, est_drb = thr/18, cre/28, cre/25, cre/20
-            est_tkl, est_int, est_blk, est_clr, est_aer = inf/55, inf/65, inf/55, 0.0, inf/14
+            ict_sot, ict_kp, ict_crs, ict_drb = thr/18, cre/22, cre/22, cre/25
+            ict_tkl, ict_int, ict_blk, ict_clr, ict_aer = inf/25, inf/30, inf/30, inf/28, inf/18
+        else:
+            ict_sot, ict_kp, ict_crs, ict_drb = thr/18, cre/28, cre/25, cre/20
+            ict_tkl, ict_int, ict_blk, ict_clr, ict_aer = inf/55, inf/65, inf/55, 0.0, inf/14
 
-        # ── FBref real Opta per-90 overrides ─────────────────────────────────
-        # Form ratios: recent-5 vs season EWM-10 (clamped 0.3–2.0)
-        def _form(avg_col: str, ewm_col: str) -> float:
-            a = float(row.get(avg_col, 0.1))
-            e = float(row.get(ewm_col, 0.1))
-            return min(2.0, max(0.3, a / max(e, 0.1)))
+        # Use Sleeper real per-90 where available, else ICT
+        est_sot = sp.get("sot",   ict_sot)
+        est_kp  = sp.get("kp",    ict_kp)
+        est_crs = sp.get("acnc",  ict_crs)
+        est_drb = sp.get("drb",   ict_drb)
+        est_tkl = sp.get("tkl",   ict_tkl)
+        est_int = sp.get("int",   ict_int)
+        est_blk = sp.get("blk",   ict_blk)
+        est_clr = sp.get("clr",   ict_clr)
+        est_aer = sp.get("aer",   ict_aer)
+        if pos == "GK" and "svs" in sp:
+            adj_saves = sp["svs"] * fdr_def * min_scale
 
-        att_form = _form("threat_avg5",     "threat_ewm10")
-        cre_form = _form("creativity_avg5", "creativity_ewm10")
-        def_form = _form("influence_avg5",  "influence_ewm10")
-
-        fb_key = _norm_name(str(row["name"]))
-        fb = fbref_stats.get(fb_key) or \
-             fbref_stats.get(_norm_name(str(row.get("display_name", ""))))  or {}
-
-        if fb:
-            # Replace ICT fallback with real per-90 * recent-form scaling
-            if "sot_per90"   in fb: est_sot = fb["sot_per90"]   * att_form
-            if "kp_per90"    in fb: est_kp  = fb["kp_per90"]    * cre_form
-            if "crs_per90"   in fb: est_crs = fb["crs_per90"]   * cre_form
-            if "drb_per90"   in fb: est_drb = fb["drb_per90"]   * att_form
-            if "tkl_per90"   in fb: est_tkl = fb["tkl_per90"]   * def_form
-            if "int_per90"   in fb: est_int = fb["int_per90"]   * def_form
-            if "blk_per90"   in fb: est_blk = fb["blk_per90"]   * def_form
-            if "clr_per90"   in fb: est_clr = fb["clr_per90"]   * def_form
-            if "aer_per90"   in fb: est_aer = fb["aer_per90"]   * def_form
-            if "saves_per90" in fb and pos == "GK":
-                adj_saves = fb["saves_per90"] * def_form * fdr_def * min_scale
-
-        # ── Apply FDR uniformly (whether from FBref or ICT) ──────────────────
+        # ── Apply FDR uniformly ───────────────────────────────────────────────
         est_sot *= att_mult;  est_kp  *= att_mult
         est_crs *= att_mult;  est_drb *= att_mult
         est_tkl *= fdr_def;   est_int *= fdr_def
         est_blk *= fdr_def;   est_clr *= fdr_def
-        # est_aer unchanged — aerial rate is roughly fixture-independent
 
         # Form indicator: compare last-3 avg points vs last-10 avg
         pts3  = float(row.get("total_points_avg3",  0))
