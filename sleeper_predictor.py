@@ -193,8 +193,9 @@ def load_sleeper_hist_pts(
     """
     cache_dir_p = Path(cache_dir)
     cache_dir_p.mkdir(exist_ok=True)
-    cache_file  = cache_dir_p / f"sleeper_hist_gw{current_gw}.json"
-    per90_file  = cache_dir_p / f"sleeper_per90_gw{current_gw}.json"
+    start_gw    = max(1, current_gw - n_weeks + 1)
+    cache_file  = cache_dir_p / f"sleeper_hist_gw{start_gw}_{current_gw}.json"
+    per90_file  = cache_dir_p / f"sleeper_per90_gw{start_gw}_{current_gw}.json"
 
     debug: list[str] = []
 
@@ -684,10 +685,19 @@ def predict_next_gw(df: pd.DataFrame, bundle: dict, feature_cols: list,
         GOAL_CAPS   = {"GK": 0.03, "DEF": 0.12, "MID": 0.40, "FWD": 0.80}
         ASSIST_CAPS = {"GK": 0.02, "DEF": 0.25, "MID": 0.50, "FWD": 0.35}
 
-        adj_goals   = min(s.get("goals_scored", 0) * att_mult * min_scale,
-                          GOAL_CAPS[pos]   * min_scale)
-        adj_assists = min(s.get("assists",       0) * att_mult * min_scale,
-                          ASSIST_CAPS[pos] * min_scale)
+        # Position floors so the model never shows exactly 0 — even defensive
+        # midfielders have some chance of contributing offensively
+        GOAL_FLOOR   = {"GK": 0.005, "DEF": 0.01,  "MID": 0.03,  "FWD": 0.05}
+        ASSIST_FLOOR = {"GK": 0.005, "DEF": 0.02,  "MID": 0.04,  "FWD": 0.04}
+
+        adj_goals   = min(
+            max(s.get("goals_scored", 0) * att_mult, GOAL_FLOOR[pos]) * min_scale,
+            GOAL_CAPS[pos] * min_scale,
+        )
+        adj_assists = min(
+            max(s.get("assists", 0) * att_mult, ASSIST_FLOOR[pos]) * min_scale,
+            ASSIST_CAPS[pos] * min_scale,
+        )
         adj_saves   = s.get("saves",          0) * fdr_def * min_scale
         adj_gc      = s.get("goals_conceded", 0) * fdr_def * min_scale
 

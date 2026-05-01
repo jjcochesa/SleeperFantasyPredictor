@@ -249,11 +249,11 @@ with st.expander("🔍 Debug", expanded=False):
 
     # Sleeper historical stats API
     st.write("**Sleeper stats API (historical points source):**")
-    _slp_cache = _cache_dir / f"sleeper_hist_gw{gw - 1}.json"
+    _slp_cache = next(iter(sorted(_cache_dir.glob("sleeper_hist_gw*.json"))), None)
     _slp_keys  = _cache_dir / "sleeper_stat_keys.json"
-    if _slp_cache.exists():
+    if _slp_cache:
         _slp_data = json.loads(_slp_cache.read_text())
-        st.write(f"  ✅ {len(_slp_data)} players with Sleeper hist pts (GW{gw-5}–GW{gw-1})")
+        st.write(f"  ✅ {len(_slp_data)} players with Sleeper hist pts ({_slp_cache.stem})")
         if _slp_keys.exists():
             st.write("  Stat fields returned by Sleeper API:")
             st.code(", ".join(json.loads(_slp_keys.read_text())))
