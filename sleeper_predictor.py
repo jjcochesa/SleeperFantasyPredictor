@@ -178,20 +178,22 @@ def load_sleeper_hist_pts(
     pos_map: dict[str, str],
     sport: str = "clubsoccer:epl",
     cache_dir: str = ".fpl_cache",
-    n_weeks: int = 5,
+    n_weeks: int = 7,      # GWs to fetch for per-90 stat calculations
+    n_avg: int = 5,        # GWs to use for the displayed avg_pts_5 column
+    min_mins: int = 30,    # Minimum minutes to include a GW in per-90 (filters cameos)
 ) -> tuple[dict[str, float], dict[str, dict], list[str]]:
     """
     Fetch last n_weeks of stats from Sleeper API.
     Returns:
-      - {norm_name: avg_sleeper_pts}   — uses pts_std directly from Sleeper
-      - {norm_name: {stat: per90}}     — per-90 averages for projection model
+      - {norm_name: avg_pts over last n_avg GWs}  — display column only
+      - {norm_name: {stat: per90}}                 — per-90 over last n_weeks GWs
       - [debug_lines]
     """
     cache_dir_p = Path(cache_dir)
     cache_dir_p.mkdir(exist_ok=True)
     start_gw    = max(1, current_gw - n_weeks + 1)
     cache_file  = cache_dir_p / f"sleeper_hist_gw{start_gw}_{current_gw}.json"
-    per90_file  = cache_dir_p / f"sleeper_per90_v4_gw{start_gw}_{current_gw}.json"
+    per90_file  = cache_dir_p / f"sleeper_per90_v5_gw{start_gw}_{current_gw}.json"
 
     debug: list[str] = []
 
@@ -238,14 +240,17 @@ def load_sleeper_hist_pts(
             json.dumps(sorted(all_seen_keys))
         )
 
-    avg_pts = {name: round(sum(pts) / len(pts), 1)
-               for name, pts in player_pts.items() if pts}
+    # avg_pts_5: last n_avg GWs only (display column — not used in prediction)
+    avg_pts = {
+        name: round(sum(pts[-n_avg:]) / len(pts[-n_avg:]), 1)
+        for name, pts in player_pts.items() if pts
+    }
 
-    # Compute per-90 averages — include every stat Sleeper scores
+    # Compute per-90 averages over n_weeks GWs, skipping cameo appearances
     per90: dict[str, dict] = {}
     _per90_keys = [
-        "g",                           # goals scored (gs = games started, not goals!)
-        "ast", "asts",                 # assists (try both field names)
+        "g",                           # goals scored (gs = games started, not goals)
+        "ast", "asts", "at",           # assists — "at" is the real Sleeper field
         "sot", "kp", "acnc", "drb",    # attacking
         "int", "tkw", "clr", "aer",    # defensive
         "bs",                          # blocked shots
@@ -260,14 +265,17 @@ def load_sleeper_hist_pts(
         totals: dict[str, float] = {}
         total_min = 0.0
         for s in gw_list:
-            total_min += float(s.get("min", 0) or 0)
+            mins = float(s.get("min", 0) or 0)
+            if mins < min_mins:        # skip cameos — inflates per-90
+                continue
+            total_min += mins
             for k in _per90_keys:
                 totals[k] = totals.get(k, 0.0) + float(s.get(k, 0) or 0)
         if total_min >= 90:
             n90 = total_min / 90
             p90 = {k: round(v / n90, 3) for k, v in totals.items()}
-            # Normalise assist field — Sleeper uses "ast" or "asts"
-            p90["ast"] = max(p90.get("ast", 0.0), p90.get("asts", 0.0))
+            # Normalise assist: "at" is the real Sleeper field; ast/asts are fallbacks
+            p90["ast"] = max(p90.get("at", 0.0), p90.get("ast", 0.0), p90.get("asts", 0.0))
             per90[norm] = p90
 
     cache_file.write_text(json.dumps(avg_pts))
