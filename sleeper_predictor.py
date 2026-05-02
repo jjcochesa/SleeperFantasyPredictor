@@ -197,7 +197,7 @@ def load_sleeper_hist_pts(
     cache_dir_p.mkdir(exist_ok=True)
     start_gw    = max(1, current_gw - n_weeks + 1)
     cache_file  = cache_dir_p / f"sleeper_hist_gw{start_gw}_{current_gw}.json"
-    per90_file  = cache_dir_p / f"sleeper_per90_v7_gw{start_gw}_{current_gw}.json"
+    per90_file  = cache_dir_p / f"sleeper_per90_v8_gw{start_gw}_{current_gw}.json"
 
     debug: list[str] = []
 
@@ -268,14 +268,17 @@ def load_sleeper_hist_pts(
     for norm, gw_list in player_stats.items():
         totals: dict[str, float] = {}
         total_min = 0.0
+        n_quals = 0
         for s in gw_list:
             mins = float(s.get("min", 0) or 0)
             if mins < min_mins:        # skip cameos — inflates per-90
                 continue
             total_min += mins
+            n_quals += 1
             for k in _per90_keys:
                 totals[k] = totals.get(k, 0.0) + float(s.get(k, 0) or 0)
-        if total_min >= 90:
+        # Require at least 3 qualifying appearances — 1-2 game samples are too noisy
+        if total_min >= 90 and n_quals >= 3:
             n90 = total_min / 90
             p90 = {k: round(v / n90, 3) for k, v in totals.items()}
             # Normalise assist: "at" is the real Sleeper field; ast/asts are fallbacks
@@ -751,7 +754,7 @@ def predict_next_gw(df: pd.DataFrame,
 
         fdr_att        = {1: 1.6, 2: 1.3, 3: 1.0, 4: 0.72, 5: 0.48}[fdr]
         opp_def_factor = min(1.6, max(0.5, opp_gc / 1.3))
-        att_mult       = fdr_att * opp_def_factor
+        att_mult       = min(2.0, fdr_att * opp_def_factor)  # cap: best fixture × worst def = 2×
         fdr_def        = {1: 0.65, 2: 0.82, 3: 1.0, 4: 1.25, 5: 1.55}[fdr]
         is_home        = int(row.get("was_home", 1))
         ha_mult        = 1.08 if is_home else 0.93
@@ -791,9 +794,11 @@ def predict_next_gw(df: pd.DataFrame,
         avg5 = _avg5(row["name"])
 
         if not sp:
-            # No Sleeper per-90 data — pure historical avg with FPL xG for display
+            # No Sleeper per-90 data — pure historical avg with FPL xG for display.
+            # Don't apply min_scale here: avg5 already reflects actual minutes played.
+            # avail_mult still applies for injury risk.
             fixture_mult = (att_mult + fdr_def) / 2.0 * ha_mult
-            pts = avg5 * fixture_mult * min_scale
+            pts = avg5 * fixture_mult
             pts *= avail_mult
             # Use FPL rolling xG/xA for display even without Sleeper per-90
             _mins90 = max(0.5, exp_min / 90)
