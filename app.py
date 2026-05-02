@@ -203,10 +203,15 @@ def _is_drafted(fpl_name: str, display_name: str, drafted_names: set[str]) -> bo
         if len(n_words & dn_set) >= 2:
             return True
 
-        # 3. Display name (≥5 chars) is the last word of a Sleeper name
-        #    — catches "Martinez" → "emi martinez", "Stach" → "anton stach"
-        if len(d) >= 5 and d == dn_words[-1]:
-            return True
+        # 3. Last word of FPL full name (≥5 chars) matches last word of a Sleeper name,
+        #    AND first-name initials agree — avoids common-surname false positives
+        #    (e.g. "callum wilson" must not match "harry wilson")
+        n_parts = n.split()
+        if n_parts and len(n_parts[-1]) >= 5 and n_parts[-1] == dn_words[-1]:
+            if len(n_parts) < 2 or len(dn_words) < 2:
+                return True  # single-name player, trust the match
+            if n_parts[0][0] == dn_words[0][0]:
+                return True
 
     return False
 

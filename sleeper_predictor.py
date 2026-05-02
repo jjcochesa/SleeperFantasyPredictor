@@ -915,16 +915,20 @@ def predict_next_gw(df: pd.DataFrame,
               + adj_og      * SLEEPER_SCORING["own_goals"]
               + adj_ps      * SLEEPER_SCORING["penalties_saved"]
             )
-            # Blend 70% stat model + 30% fixture-adjusted historical avg.
-            # The historical component anchors player quality — prevents hot-streak
-            # inflation (Flemming ≈ Watkins) and cold-patch underrating (Van Hecke).
-            hist_mult = (att_mult + fdr_def) / 2.0 * ha_mult * min_scale
+            # Historical baseline uses fixture mult WITHOUT min_scale — avg5 already
+            # reflects actual minutes played, so applying min_scale again double-penalizes
+            # returning players (e.g. Stach after injury: FPL mins≈0, Sleeper avg=14).
+            hist_mult     = (att_mult + fdr_def) / 2.0 * ha_mult
             hist_baseline = avg5 * hist_mult
-            # Cap stat_pts at 3× historical baseline for players with a clear history
-            # — prevents outlier per-90 (e.g. one big KP game) from dominating
+            # stat_pts still uses min_scale (correctly projects per-90 → actual minutes)
+            # Cap stat_pts at 3× historical baseline — prevents outlier per-90 dominating
             if avg5 > 1.0:
                 stat_pts = min(stat_pts, 3.0 * max(hist_baseline, 1.0))
-            pts = 0.70 * stat_pts + 0.30 * hist_baseline
+            # Adaptive blend: when stat data is sparse/zero, lean on history more
+            if hist_baseline > 0 and stat_pts < hist_baseline * 0.15:
+                pts = 0.20 * stat_pts + 0.80 * hist_baseline
+            else:
+                pts = 0.70 * stat_pts + 0.30 * hist_baseline
 
         pts *= avail_mult
 
