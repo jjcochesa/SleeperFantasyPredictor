@@ -144,6 +144,47 @@ def get_league_data(league_id: str) -> tuple[set[str], str]:
         return set(), f"Could not reach Sleeper: {e}"
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def get_my_roster(league_id: str, username: str) -> tuple[set[str], str]:
+    """Fetch just this user's roster. Returns (set_of_player_names, status)."""
+    try:
+        ur = requests.get(f"{SLEEPER_API}/user/{username}", timeout=10)
+        if ur.status_code != 200:
+            return set(), f"Sleeper user '{username}' not found"
+        user_id = str(ur.json().get("user_id", ""))
+        if not user_id:
+            return set(), "Could not retrieve user_id from Sleeper"
+
+        rr = requests.get(f"{SLEEPER_API}/league/{league_id}/rosters", timeout=15)
+        rr.raise_for_status()
+        rosters = rr.json()
+
+        my_roster = next(
+            (ros for ros in rosters if str(ros.get("owner_id", "")) == user_id), None
+        )
+        if not my_roster:
+            return set(), f"No roster found for '{username}' in this league"
+
+        player_ids: set[str] = set()
+        for field in ("players", "reserve", "taxi"):
+            for pid in (my_roster.get(field) or []):
+                player_ids.add(str(pid))
+
+        name_map, _ = get_sleeper_name_map()
+        my_names: set[str] = set()
+        for pid in player_ids:
+            name = name_map.get(pid, "")
+            if name:
+                my_names.add(_normalise(name))
+
+        return my_names, f"✅ {len(player_ids)} players on your roster"
+
+    except requests.HTTPError as e:
+        return set(), f"Sleeper API error: {e.response.status_code}"
+    except Exception as e:
+        return set(), f"Error fetching roster: {e}"
+
+
 def _is_drafted(fpl_name: str, display_name: str, drafted_names: set[str]) -> bool:
     """Return True if this player appears in the drafted set."""
     n = _normalise(fpl_name)
@@ -296,6 +337,74 @@ for tab, pos in zip(tabs, ["GK", "DEF", "MID", "FWD"]):
         sub = tab_src[tab_src["position"] == pos].head(10)
         st.dataframe(sub[_DISPLAY_COLS], use_container_width=True, hide_index=True,
                      column_config=_COL_CONFIG)
+
+# ── My Team ───────────────────────────────────────────────────────────────────
+st.markdown("---")
+st.subheader("My Team")
+
+username = st.text_input(
+    "Your Sleeper username",
+    placeholder="e.g. jjcochesa",
+    help="Enter your Sleeper username to see lineup suggestions and waiver targets",
+)
+
+if username.strip():
+    with st.spinner("Loading your roster..."):
+        my_names, my_status = get_my_roster(SLEEPER_LEAGUE_ID, username.strip())
+    st.caption(my_status)
+
+    if my_names:
+        my_players = predictions[
+            predictions.apply(
+                lambda r: _is_drafted(r["name"], r["display_name"], my_names), axis=1
+            )
+        ].sort_values("sleeper_pts", ascending=False).reset_index(drop=True)
+
+        if len(my_players) == 0:
+            st.warning("Roster found but no players matched predictions — name matching may need tuning.")
+        else:
+            col_left, col_right = st.columns([3, 2])
+
+            with col_left:
+                st.markdown("**Starting 11** *(sorted by predicted pts)*")
+                starters = my_players.head(11)
+                st.dataframe(
+                    starters[_DISPLAY_COLS],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config=_COL_CONFIG,
+                )
+                if len(my_players) > 11:
+                    st.markdown("**Bench**")
+                    bench = my_players.iloc[11:]
+                    st.dataframe(
+                        bench[_DISPLAY_COLS],
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config=_COL_CONFIG,
+                    )
+
+            with col_right:
+                st.markdown("**Top Waiver Targets**")
+                if league_ok:
+                    available = predictions[
+                        ~predictions.apply(
+                            lambda r: _is_drafted(r["name"], r["display_name"], drafted_ids),
+                            axis=1,
+                        )
+                    ]
+                    wtabs = st.tabs(["🧤 GK", "🛡️ DEF", "🎯 MID", "⚡ FWD"])
+                    for wtab, pos in zip(wtabs, ["GK", "DEF", "MID", "FWD"]):
+                        with wtab:
+                            top_avail = available[available["position"] == pos].head(5)
+                            st.dataframe(
+                                top_avail[_DISPLAY_COLS],
+                                use_container_width=True,
+                                hide_index=True,
+                                column_config=_COL_CONFIG,
+                            )
+                else:
+                    st.info("League sync required for waiver targets.")
 
 # Refresh
 st.markdown("---")
