@@ -790,13 +790,22 @@ def predict_next_gw(df: pd.DataFrame,
         avg5 = _avg5(row["name"])
 
         if not sp:
-            # No Sleeper per-90 data — pure historical avg (no stat blend possible)
+            # No Sleeper per-90 data — pure historical avg with FPL xG for display
             fixture_mult = (att_mult + fdr_def) / 2.0 * ha_mult
             pts = avg5 * fixture_mult * min_scale
-            adj_goals = adj_assists = est_sot = est_kp = 0.0
-            est_tkl = est_int = adj_saves = 0.0
-            prob_cs_out = 0.0
             pts *= avail_mult
+            # Use FPL rolling xG/xA for display even without Sleeper per-90
+            _mins90 = max(0.5, exp_min / 90)
+            _fpl_xg = float(row.get("expected_goals_avg5",  0) or 0) / _mins90
+            _fpl_xa = float(row.get("expected_assists_avg5", 0) or 0) / _mins90
+            fb_goals   = round(max(_fpl_xg * att_mult * ha_mult * min_scale, GOAL_FLOOR[pos]),   2)
+            fb_assists = round(max(_fpl_xa * att_mult * ha_mult * min_scale, ASSIST_FLOOR[pos]), 2)
+            # Poisson CS for defenders/GKs
+            if pos in ("GK", "DEF"):
+                opp_gs_avg = float(row.get("opp_goals_scored_avg5", 1.3) or 1.3)
+                _prob_cs = math.exp(-opp_gs_avg * fdr_def * ha_mult)
+            else:
+                _prob_cs = 0.0
             rows.append({
                 "name":         row["name"],
                 "display_name": row.get("display_name", row["name"]),
@@ -811,10 +820,12 @@ def predict_next_gw(df: pd.DataFrame,
                 "avail":        f"{int(chance)}%" if status != "a" else "OK",
                 "avg_pts_5":    avg5,
                 "exp_min":      round(exp_min, 1),
-                "exp_goals":    0.0, "exp_assists": 0.0,
-                "exp_sot":      0.0, "exp_kp":      0.0,
-                "exp_tkl":      0.0, "exp_int":     0.0,
-                "exp_saves":    0.0, "exp_cs":      0.0,
+                "exp_goals":    fb_goals,
+                "exp_assists":  fb_assists,
+                "exp_sot":      0.0, "exp_kp":  0.0,
+                "exp_tkl":      0.0, "exp_int": 0.0,
+                "exp_saves":    0.0,
+                "exp_cs":       round(_prob_cs, 3),
                 "sleeper_pts":  round(pts, 2),
             })
             continue
