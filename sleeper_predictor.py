@@ -919,7 +919,12 @@ def predict_next_gw(df: pd.DataFrame,
             # The historical component anchors player quality — prevents hot-streak
             # inflation (Flemming ≈ Watkins) and cold-patch underrating (Van Hecke).
             hist_mult = (att_mult + fdr_def) / 2.0 * ha_mult * min_scale
-            pts = 0.70 * stat_pts + 0.30 * (avg5 * hist_mult)
+            hist_baseline = avg5 * hist_mult
+            # Cap stat_pts at 3× historical baseline for players with a clear history
+            # — prevents outlier per-90 (e.g. one big KP game) from dominating
+            if avg5 > 1.0:
+                stat_pts = min(stat_pts, 3.0 * max(hist_baseline, 1.0))
+            pts = 0.70 * stat_pts + 0.30 * hist_baseline
 
         pts *= avail_mult
 
