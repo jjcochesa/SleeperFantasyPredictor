@@ -197,7 +197,7 @@ def load_sleeper_hist_pts(
     cache_dir_p.mkdir(exist_ok=True)
     start_gw    = max(1, current_gw - n_weeks + 1)
     cache_file  = cache_dir_p / f"sleeper_hist_gw{start_gw}_{current_gw}.json"
-    per90_file  = cache_dir_p / f"sleeper_per90_v8_gw{start_gw}_{current_gw}.json"
+    per90_file  = cache_dir_p / f"sleeper_per90_v9_gw{start_gw}_{current_gw}.json"
 
     debug: list[str] = []
 
@@ -716,11 +716,22 @@ def predict_next_gw(df: pd.DataFrame,
         current_gw=next_gw - 1,
         name_map=_name_map,
         pos_map=pos_map,
+        n_weeks=20,   # wider window → stable season-long defensive per-90 stats
     )
 
     # Fallback: FPL-derived partial Sleeper pts (missing Opta stats)
     fpl_last5 = (
         df.sort_values("GW")
+        .groupby("name")["sleeper_pts_hist"]
+        .apply(lambda s: round(s.tail(5).mean(), 1))
+        .to_dict()
+    )
+
+    # Played-games avg: last 5 games where player actually appeared (minutes > 0).
+    # Used as a floor for returning-from-injury players whose avg5 is deflated
+    # by weeks of 0-minute blanks (Senesi, Saka, Calafiori type misses).
+    fpl_last5_played = (
+        df[df["minutes"] > 0].sort_values("GW")
         .groupby("name")["sleeper_pts_hist"]
         .apply(lambda s: round(s.tail(5).mean(), 1))
         .to_dict()
@@ -803,6 +814,15 @@ def predict_next_gw(df: pd.DataFrame,
                     break
         avg5 = _avg5(row["name"])
 
+        # Returning-player floor: if the player appeared in their last historical GW
+        # but avg5 is dragged down by injury blanks, use played-games avg as a floor.
+        # Scale by 0.75 (conservatism) — FPL sleeper_pts_hist misses Opta stats so
+        # played avg is systematically lower than true Sleeper value.
+        last_mins_actual = float(row.get("minutes", 0) or 0)
+        avg5_played = fpl_last5_played.get(row["name"], avg5)
+        if last_mins_actual >= 45 and avg5_played > avg5 * 1.4:
+            avg5 = max(avg5, avg5_played * 0.75)
+
         if not sp:
             # No Sleeper per-90 data — pure historical avg with FPL xG for display.
             # Don't apply min_scale here: avg5 already reflects actual minutes played.
@@ -873,6 +893,18 @@ def predict_next_gw(df: pd.DataFrame,
             # tkw = tackles won (real Sleeper field, separate from interceptions)
             est_tkl = sp.get("tkw", 0.0) * fdr_def * ha_mult * min_scale
             est_int = sp.get("int", 0.0) * fdr_def * ha_mult * min_scale
+
+            # Defensive anchor CS bonus: high-defensive-action DEF/GK who are likely
+            # to clean sheet tend to peak on those same occasions — CS games correlate
+            # with elevated defensive output (Hill/Senesi/Van den Berg type players).
+            # Graduated boost: +5% per unit of intensity above 2.0, capped at +30%.
+            if pos in ("DEF", "GK"):
+                _def_intensity = sp.get("tkw", 0.0) + sp.get("int", 0.0)
+                if _def_intensity > 2.0 and prob_cs > 0.20:
+                    _cs_boost = min(1.30, 1.0 + (_def_intensity - 2.0) * 0.10)
+                    est_tkl *= _cs_boost
+                    est_int *= _cs_boost
+
             est_clr = sp.get("clr", 0.0) * fdr_def * ha_mult * min_scale
             est_aer = sp.get("aer", 0.0) * fdr_def * ha_mult * min_scale
             est_blk = sp.get("bs",  0.0) * fdr_def * ha_mult * min_scale  # bs = blocked shots
@@ -928,12 +960,16 @@ def predict_next_gw(df: pd.DataFrame,
             # Historical baseline uses fixture mult WITHOUT min_scale — avg5 already
             # reflects actual minutes played, so applying min_scale again double-penalizes
             # returning players (e.g. Stach after injury: FPL mins≈0, Sleeper avg=14).
-            hist_mult     = (att_mult + fdr_def) / 2.0 * ha_mult
+            hist_mult = (att_mult + fdr_def) / 2.0 * ha_mult
+            # Floor: don't let fixture penalties drag quality players below 70% of avg
+            # (prevents FDR4/5 away over-suppression for players with strong form)
+            if avg5 >= 7.0:
+                hist_mult = max(hist_mult, 0.70)
             hist_baseline = avg5 * hist_mult
             # stat_pts still uses min_scale (correctly projects per-90 → actual minutes)
             # Cap stat_pts at 3× historical baseline — prevents outlier per-90 dominating
-            if avg5 > 1.0:
-                stat_pts = min(stat_pts, 3.0 * max(hist_baseline, 1.0))
+            # (no avg5 guard: Tanaka-type players with avg5<1 also need the cap)
+            stat_pts = min(stat_pts, 3.0 * max(hist_baseline, 1.0))
             # Adaptive blend: when stat data is sparse/zero, lean on history more
             if hist_baseline > 0 and stat_pts < hist_baseline * 0.15:
                 pts = 0.20 * stat_pts + 0.80 * hist_baseline
