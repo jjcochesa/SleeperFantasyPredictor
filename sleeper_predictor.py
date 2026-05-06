@@ -823,6 +823,13 @@ def predict_next_gw(df: pd.DataFrame,
         if last_mins_actual >= 45 and avg5_played > avg5 * 1.4:
             avg5 = max(avg5, avg5_played * 0.75)
 
+        # Quality floor on att_mult: for established starters (avg5 ≥ 7), don't let
+        # attacking fixture penalty suppress per-90 stats below 70%.
+        # Prevents FDR5 away (e.g. att_mult = 0.30 vs Arsenal) from halving predictions
+        # for quality players — fixture is tough but they still contribute at 70%+ rate.
+        if avg5 >= 7.0:
+            att_mult = max(att_mult, 0.70)
+
         if not sp:
             # No Sleeper per-90 data — pure historical avg with FPL xG for display.
             # Don't apply min_scale here: avg5 already reflects actual minutes played.
@@ -960,11 +967,7 @@ def predict_next_gw(df: pd.DataFrame,
             # Historical baseline uses fixture mult WITHOUT min_scale — avg5 already
             # reflects actual minutes played, so applying min_scale again double-penalizes
             # returning players (e.g. Stach after injury: FPL mins≈0, Sleeper avg=14).
-            hist_mult = (att_mult + fdr_def) / 2.0 * ha_mult
-            # Floor: don't let fixture penalties drag quality players below 70% of avg
-            # (prevents FDR4/5 away over-suppression for players with strong form)
-            if avg5 >= 7.0:
-                hist_mult = max(hist_mult, 0.70)
+            hist_mult     = (att_mult + fdr_def) / 2.0 * ha_mult
             hist_baseline = avg5 * hist_mult
             # stat_pts still uses min_scale (correctly projects per-90 → actual minutes)
             # Cap stat_pts at 3× historical baseline — prevents outlier per-90 dominating
