@@ -232,13 +232,29 @@ def get_predictions(gw_override: int | None = None) -> pd.DataFrame:
 
 st.title("⚽ Sleeper Fantasy Predictor")
 
-# Sidebar: retroactive GW selector for validation
+# Session state for GW override (only applied on button click)
+if "gw_override" not in st.session_state:
+    st.session_state.gw_override = None
+
 with st.sidebar:
     st.markdown("### GW Override")
-    st.caption("Set to a past GW to regenerate predictions using only data available before that week — useful for comparing predictions vs actuals.")
-    gw_override_input = st.number_input("Predict for GW", min_value=0, max_value=38, value=0, step=1,
-                                         help="0 = current gameweek (default)")
-    gw_override = int(gw_override_input) if gw_override_input > 0 else None
+    st.caption("Select a past GW to regenerate predictions using only data before that week — useful for comparing predictions vs actuals.")
+    gw_options = ["Current GW (default)"] + [f"GW {g}" for g in range(1, 39)]
+    current_label = (
+        f"GW {st.session_state.gw_override}"
+        if st.session_state.gw_override
+        else "Current GW (default)"
+    )
+    current_idx = gw_options.index(current_label) if current_label in gw_options else 0
+    selected_gw_label = st.selectbox("Predict for GW", gw_options, index=current_idx)
+    if st.button("Apply", type="primary", use_container_width=True):
+        new_override = None if selected_gw_label == "Current GW (default)" else int(selected_gw_label.split()[-1])
+        if new_override != st.session_state.gw_override:
+            st.session_state.gw_override = new_override
+            get_predictions.clear()
+        st.rerun()
+
+gw_override = st.session_state.gw_override
 
 with st.spinner("Loading predictions — first run takes ~3 min..."):
     try:
