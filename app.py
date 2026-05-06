@@ -98,6 +98,9 @@ def get_sleeper_name_map() -> tuple[dict[str, str], list[str]]:
 
 def _normalise(name: str) -> str:
     """Lowercase and strip accents."""
+    # Turkish dotless-ı (U+0131) and dotted-İ (U+0130) have no NFKD decomposition
+    # and would mismatch against plain ASCII i — replace before NFKD pass.
+    name = name.replace("ı", "i").replace("İ", "i")
     nfkd = unicodedata.normalize("NFKD", name.lower().strip())
     return "".join(c for c in nfkd if not unicodedata.combining(c))
 
