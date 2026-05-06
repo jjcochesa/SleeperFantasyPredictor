@@ -236,7 +236,7 @@ st.title("⚽ Sleeper Fantasy Predictor")
 with st.sidebar:
     st.markdown("### GW Override")
     st.caption("Set to a past GW to regenerate predictions using only data available before that week — useful for comparing predictions vs actuals.")
-    gw_override_input = st.number_input("Predict for GW", min_value=1, max_value=38, value=0, step=1,
+    gw_override_input = st.number_input("Predict for GW", min_value=0, max_value=38, value=0, step=1,
                                          help="0 = current gameweek (default)")
     gw_override = int(gw_override_input) if gw_override_input > 0 else None
 
