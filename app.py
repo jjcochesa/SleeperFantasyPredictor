@@ -447,6 +447,9 @@ if username.strip():
                     hide_index=True,
                     column_config=_COL_CONFIG,
                 )
+                total_pts = starters["sleeper_pts"].sum()
+                st.metric("Starting XI — Total Expected Pts", f"{total_pts:.1f}")
+
                 if len(my_players) > 11:
                     st.markdown("**Bench**")
                     bench = my_players.iloc[11:]
