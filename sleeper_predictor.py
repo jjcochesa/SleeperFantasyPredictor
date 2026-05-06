@@ -823,6 +823,13 @@ def predict_next_gw(df: pd.DataFrame,
         if last_mins_actual >= 45 and avg5_played > avg5 * 1.4:
             avg5 = max(avg5, avg5_played * 0.75)
 
+        # min_scale fix for injury-returning players: FPL minutes_avg5 uses shift(1)
+        # so the return-game row sees only injury weeks (minutes=0) → min_scale=0 →
+        # all per-90 stats zeroed out despite good Sleeper data (Stach, Calafiori etc.)
+        # If the player actually played last GW, use their real minutes as the floor.
+        if last_mins_actual >= 45:
+            min_scale = max(min_scale, min(1.0, last_mins_actual / 90))
+
         # Quality floor on att_mult: for established starters (avg5 ≥ 7), don't let
         # attacking fixture penalty suppress per-90 stats below 70%.
         # Prevents FDR5 away (e.g. att_mult = 0.30 vs Arsenal) from halving predictions
