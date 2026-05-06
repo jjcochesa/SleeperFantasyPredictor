@@ -219,22 +219,30 @@ def _is_drafted(fpl_name: str, display_name: str, drafted_names: set[str]) -> bo
 # ── FPL predictions ───────────────────────────────────────────────────────────
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def get_predictions() -> pd.DataFrame:
+def get_predictions(gw_override: int | None = None) -> pd.DataFrame:
     fpl_client = FPLDataClient()
     boot       = fpl_client.bootstrap()
     fixtures   = fpl_client.fixtures()
     df, ts     = load_current_season_data(fpl_client, boot, fixtures)
     feat       = engineer_features(df)
-    return predict_next_gw(feat, ts, fixtures, boot)
+    return predict_next_gw(feat, ts, fixtures, boot, gw_override=gw_override)
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
 
 st.title("⚽ Sleeper Fantasy Predictor")
 
+# Sidebar: retroactive GW selector for validation
+with st.sidebar:
+    st.markdown("### GW Override")
+    st.caption("Set to a past GW to regenerate predictions using only data available before that week — useful for comparing predictions vs actuals.")
+    gw_override_input = st.number_input("Predict for GW", min_value=1, max_value=38, value=0, step=1,
+                                         help="0 = current gameweek (default)")
+    gw_override = int(gw_override_input) if gw_override_input > 0 else None
+
 with st.spinner("Loading predictions — first run takes ~3 min..."):
     try:
-        predictions = get_predictions()
+        predictions = get_predictions(gw_override=gw_override)
     except Exception as e:
         st.error(f"Failed to load predictions: {e}")
         st.stop()

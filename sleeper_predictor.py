@@ -623,16 +623,26 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================================
 
 def predict_next_gw(df: pd.DataFrame,
-                    ts: pd.DataFrame, fixtures: list, boot: dict) -> pd.DataFrame:
+                    ts: pd.DataFrame, fixtures: list, boot: dict,
+                    gw_override: int | None = None) -> pd.DataFrame:
     data_gw = int(df["GW"].max())
-    # Switch to the following GW as soon as the current one has kicked off.
-    # This means predictions are ready before the last game ends — important
-    # for waiver deadlines which run ~2 hours after the final whistle.
-    current_gw_started = any(
-        f.get("event") == data_gw + 1 and f.get("started")
-        for f in fixtures
-    )
-    next_gw = data_gw + 2 if current_gw_started else data_gw + 1
+
+    if gw_override:
+        # Retroactive mode: filter data to what was available before this GW
+        df = df[df["GW"] < gw_override].copy()
+        if df.empty:
+            raise ValueError(f"No data available before GW{gw_override}")
+        next_gw = gw_override
+    else:
+        # Switch to the following GW as soon as the current one has kicked off.
+        # This means predictions are ready before the last game ends — important
+        # for waiver deadlines which run ~2 hours after the final whistle.
+        current_gw_started = any(
+            f.get("event") == data_gw + 1 and f.get("started")
+            for f in fixtures
+        )
+        next_gw = data_gw + 2 if current_gw_started else data_gw + 1
+
     base = df.sort_values("GW").groupby("name").tail(1).copy()
     base["GW"] = next_gw
 
