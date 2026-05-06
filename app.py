@@ -318,25 +318,66 @@ with st.expander("🔍 Debug", expanded=False):
     # Sleeper historical stats API
     st.write("**Sleeper stats API (historical points source):**")
     _slp_cache = next(iter(sorted(_cache_dir.glob("sleeper_hist_gw*.json"))), None)
-    _slp_per90 = next(iter(sorted(_cache_dir.glob("sleeper_per90_v8_*.json"))), None)
+    _slp_per90 = next(iter(sorted(_cache_dir.glob("sleeper_per90_v9_*.json"))), None)
     _slp_keys  = _cache_dir / "sleeper_stat_keys.json"
     if _slp_cache:
         _slp_data = json.loads(_slp_cache.read_text())
         st.write(f"  ✅ {len(_slp_data)} players with Sleeper hist pts ({_slp_cache.stem})")
         if _slp_per90:
             _per90_data = json.loads(_slp_per90.read_text())
-            # Show a GK's per-90 data to verify save field
-            gk_sample = {k: v for k, v in list(_per90_data.items())[:3]}
             st.write(f"  Per-90 cache: {len(_per90_data)} players")
-            st.write("  Sample per-90 (first 3 players):")
-            st.json(gk_sample)
         if _slp_keys.exists():
             st.write("  All Sleeper API stat fields observed:")
             st.code(", ".join(json.loads(_slp_keys.read_text())))
     else:
         st.write("  ❌ Not fetched yet — click Refresh Predictions")
 
+    # ── Player stat inspector ─────────────────────────────────────────────────
+    st.markdown("---")
+    st.write("**Player stat inspector** — check raw Sleeper fields for any player:")
+    _inspect_name = st.text_input("Player name (partial match)", placeholder="e.g. Stach, Dorgu")
+    if _inspect_name.strip():
+        try:
+            from sleeper_predictor import _norm_name, _sleeper_season_year, SLEEPER_API
+            _nm_map, _ = get_sleeper_name_map()
+            _rev_map = {v: k for k, v in _nm_map.items()}  # name → pid
+            _query = _inspect_name.strip().lower()
+            _pid_hits = {pid: name for pid, name in _nm_map.items()
+                         if _query in name.lower()}
+            if not _pid_hits:
+                st.warning(f"No Sleeper player found matching '{_inspect_name}'")
+            else:
+                st.write(f"Found {len(_pid_hits)} match(es): {list(_pid_hits.values())[:5]}")
+                _year = _sleeper_season_year()
+                _gw_check = int(predictions["GW"].iloc[0]) - 1
+                _sr = requests.get(
+                    f"{SLEEPER_API}/stats/clubsoccer:epl/regular/{_year}/{_gw_check}",
+                    timeout=15)
+                if _sr.status_code == 200:
+                    _week = _sr.json()
+                    for _pid, _pname in list(_pid_hits.items())[:3]:
+                        _stats = _week.get(str(_pid), {})
+                        st.write(f"**{_pname}** (GW{_gw_check}, pid={_pid})")
+                        _nz = {k: v for k, v in _stats.items() if v}
+                        if _nz:
+                            st.json(_nz)
+                        else:
+                            st.write("  No stats recorded this GW (did not play or not tracked)")
+                    # Also show their per-90 entry from cache
+                    if _slp_per90:
+                        st.write("**Per-90 cache entries:**")
+                        _per90_data = json.loads(_slp_per90.read_text())
+                        for _pid, _pname in list(_pid_hits.items())[:3]:
+                            _nkey = _norm_name(_pname)
+                            _p90 = _per90_data.get(_nkey, {})
+                            st.write(f"  {_pname} → norm='{_nkey}': {_p90 if _p90 else '(no per-90 entry)'}")
+                else:
+                    st.error(f"Sleeper API returned {_sr.status_code}")
+        except Exception as _e:
+            st.error(f"Inspector error: {_e}")
+
     # Sleeper name matching
+    st.markdown("---")
     st.write("**Sleeper name matching:**")
     sample_drafted = sorted(drafted_ids)[:10]
     sample_fpl     = predictions[["name", "display_name"]].head(10).values.tolist()
