@@ -763,7 +763,7 @@ def predict_next_gw(df: pd.DataFrame,
 
         status = row.get("status", "a")
         chance = float(row.get("chance_of_playing", 100))
-        avail_mult = 0.0 if (status in ("i", "s") or chance == 0) else 1.0
+        avail_mult = 1.0  # availability shown in UI — user decides; model always predicts full
 
         exp_min   = float(row.get("minutes_avg5", 60))
         min_scale = min(1.0, exp_min / 90)
