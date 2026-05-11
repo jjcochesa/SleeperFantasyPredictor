@@ -977,9 +977,11 @@ def predict_next_gw(df: pd.DataFrame,
             hist_mult     = (att_mult + fdr_def) / 2.0 * ha_mult
             hist_baseline = avg5 * hist_mult
             # stat_pts still uses min_scale (correctly projects per-90 → actual minutes)
-            # Cap stat_pts at 3× historical baseline — prevents outlier per-90 dominating
-            # (no avg5 guard: Tanaka-type players with avg5<1 also need the cap)
-            stat_pts = min(stat_pts, 3.0 * max(hist_baseline, 1.0))
+            # Cap stat_pts at 3× baseline — use avg_pts_played so form-dip players
+            # (e.g. Gravenberch avg5=3.2 but scores ~8 when he plays) aren't ceiling'd
+            # by a cold streak; hist_baseline kept as fallback floor for the cap.
+            _played_baseline = avg5_played * hist_mult
+            stat_pts = min(stat_pts, 3.0 * max(_played_baseline, hist_baseline, 1.0))
             # Adaptive blend: when stat data is sparse/zero, lean on history more
             if hist_baseline > 0 and stat_pts < hist_baseline * 0.15:
                 pts = 0.20 * stat_pts + 0.80 * hist_baseline
