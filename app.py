@@ -28,17 +28,19 @@ SLEEPER_LEAGUE_ID = "1255585419836260352"
 SLEEPER_API       = "https://api.sleeper.app/v1"
 
 _DISPLAY_COLS = [
-    "display_name", "team", "opp", "ha", "fdr", "position", "form", "avail",
+    "display_name", "team", "opp", "ha", "fdr_color", "position", "form", "avail",
     "avg_pts_5", "exp_goals", "exp_assists", "exp_sot", "exp_kp", "exp_tkl", "exp_int",
     "exp_saves", "exp_cs", "sleeper_pts",
 ]
+
+_FDR_DOT = {1: "🟢", 2: "🟢", 3: "🟡", 4: "🔴", 5: "🔴"}
 
 _COL_CONFIG = {
     "display_name": st.column_config.TextColumn("Player"),
     "team":         st.column_config.TextColumn("Team"),
     "opp":          st.column_config.TextColumn("Opp"),
     "ha":           st.column_config.TextColumn("H/A"),
-    "fdr":          st.column_config.NumberColumn("FDR"),
+    "fdr_color":    st.column_config.TextColumn("FDR"),
     "position":     st.column_config.TextColumn("Pos"),
     "form":         st.column_config.TextColumn("Form"),
     "avail":        st.column_config.TextColumn("Avail"),
@@ -51,8 +53,15 @@ _COL_CONFIG = {
     "exp_int":      st.column_config.NumberColumn("Int",   format="%.2f"),
     "exp_saves":    st.column_config.NumberColumn("Saves", format="%.2f"),
     "exp_cs":       st.column_config.NumberColumn("CS%",   format="%.2f"),
-    "sleeper_pts":  st.column_config.NumberColumn("Pts",   format="%.1f"),
+    "sleeper_pts":  st.column_config.ProgressColumn("Pts", min_value=0, max_value=30, format="%.1f"),
 }
+
+
+def _with_display_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """Add fdr_color column for colored FDR rendering."""
+    out = df.copy()
+    out["fdr_color"] = out["fdr"].map(lambda x: f"{_FDR_DOT.get(int(x), '⚪')} {int(x)}")
+    return out
 
 
 # ── Sleeper roster fetch ──────────────────────────────────────────────────────
@@ -269,6 +278,18 @@ with st.spinner("Loading predictions — first run takes ~3 min..."):
 gw = int(predictions["GW"].iloc[0])
 st.markdown(f"### Gameweek {gw} Predictions")
 
+# Best picks cards
+bc1, bc2, bc3, bc4 = st.columns(4)
+for col, pos, icon in zip(
+    [bc1, bc2, bc3, bc4],
+    ["GK", "DEF", "MID", "FWD"],
+    ["🧤", "🛡️", "🎯", "⚡"],
+):
+    top = predictions[predictions["position"] == pos].iloc[0]
+    with col:
+        st.metric(f"{icon} Top {pos}", f"{top['sleeper_pts']:.1f} pts")
+        st.caption(top["display_name"])
+
 # Filters row
 c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
 with c1:
@@ -393,7 +414,7 @@ with st.expander("🔍 Debug", expanded=False):
     st.code("\n".join(name_debug))
 
 st.dataframe(
-    view[_DISPLAY_COLS].head(100),
+    _with_display_cols(view)[_DISPLAY_COLS].head(100),
     use_container_width=True,
     hide_index=True,
     column_config=_COL_CONFIG,
@@ -408,8 +429,8 @@ tabs = st.tabs(["🧤 GK", "🛡️ DEF", "🎯 MID", "⚡ FWD"])
 for tab, pos in zip(tabs, ["GK", "DEF", "MID", "FWD"]):
     with tab:
         sub = tab_src[tab_src["position"] == pos].head(10)
-        st.dataframe(sub[_DISPLAY_COLS], use_container_width=True, hide_index=True,
-                     column_config=_COL_CONFIG)
+        st.dataframe(_with_display_cols(sub)[_DISPLAY_COLS], use_container_width=True,
+                     hide_index=True, column_config=_COL_CONFIG)
 
 # ── My Team ───────────────────────────────────────────────────────────────────
 st.markdown("---")
@@ -442,7 +463,7 @@ if username.strip():
                 st.markdown("**Starting 11** *(sorted by predicted pts)*")
                 starters = my_players.head(11)
                 st.dataframe(
-                    starters[_DISPLAY_COLS],
+                    _with_display_cols(starters)[_DISPLAY_COLS],
                     use_container_width=True,
                     hide_index=True,
                     column_config=_COL_CONFIG,
@@ -454,7 +475,7 @@ if username.strip():
                     st.markdown("**Bench**")
                     bench = my_players.iloc[11:]
                     st.dataframe(
-                        bench[_DISPLAY_COLS],
+                        _with_display_cols(bench)[_DISPLAY_COLS],
                         use_container_width=True,
                         hide_index=True,
                         column_config=_COL_CONFIG,
@@ -474,7 +495,7 @@ if username.strip():
                         with wtab:
                             top_avail = available[available["position"] == pos].head(5)
                             st.dataframe(
-                                top_avail[_DISPLAY_COLS],
+                                _with_display_cols(top_avail)[_DISPLAY_COLS],
                                 use_container_width=True,
                                 hide_index=True,
                                 column_config=_COL_CONFIG,
