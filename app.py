@@ -30,10 +30,28 @@ SLEEPER_API       = "https://api.sleeper.app/v1"
 _DISPLAY_COLS = [
     "display_name", "team", "opp", "ha", "fdr_color", "position", "form", "avail",
     "avg_pts_5", "exp_goals", "exp_assists", "exp_sot", "exp_kp", "exp_tkl", "exp_int",
-    "exp_saves", "exp_cs", "sleeper_pts",
+    "exp_saves", "cs_pct", "sleeper_pts",
 ]
 
 _FDR_DOT = {1: "🟢", 2: "🟢", 3: "🟡", 4: "🔴", 5: "🔴"}
+
+# FPL team abbreviation → The Odds API team name
+_TEAM_ODDS_MAP = {
+    "ARS": "Arsenal",             "AVL": "Aston Villa",
+    "BOU": "Bournemouth",         "BHA": "Brighton and Hove Albion",
+    "BRE": "Brentford",           "BUR": "Burnley",
+    "CHE": "Chelsea",             "CRY": "Crystal Palace",
+    "EVE": "Everton",             "FUL": "Fulham",
+    "IPS": "Ipswich Town",        "LEE": "Leeds United",
+    "LEI": "Leicester City",      "LIV": "Liverpool",
+    "LUT": "Luton Town",          "MCI": "Manchester City",
+    "MUN": "Manchester United",   "NEW": "Newcastle United",
+    "NFO": "Nottingham Forest",   "SHU": "Sheffield United",
+    "SOU": "Southampton",         "SUN": "Sunderland",
+    "TOT": "Tottenham Hotspur",   "WHU": "West Ham United",
+    "WOL": "Wolverhampton Wanderers",
+}
+_ODDS_TEAM_MAP = {v: k for k, v in _TEAM_ODDS_MAP.items()}
 
 _COL_CONFIG = {
     "display_name": st.column_config.TextColumn("Player"),
@@ -52,15 +70,72 @@ _COL_CONFIG = {
     "exp_tkl":      st.column_config.NumberColumn("Tkl",   format="%.2f"),
     "exp_int":      st.column_config.NumberColumn("Int",   format="%.2f"),
     "exp_saves":    st.column_config.NumberColumn("Saves", format="%.2f"),
-    "exp_cs":       st.column_config.NumberColumn("CS%",   format="%.2f"),
-    "sleeper_pts":  st.column_config.ProgressColumn("Pts", min_value=0, max_value=30, format="%.1f"),
+    "cs_pct":       st.column_config.TextColumn("CS%"),
+    "sleeper_pts":  st.column_config.NumberColumn("Pts",   format="%.1f"),
 }
 
 
-def _with_display_cols(df: pd.DataFrame) -> pd.DataFrame:
-    """Add fdr_color column for colored FDR rendering."""
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_bookie_cs() -> dict[str, float]:
+    """Fetch EPL H2H odds from The Odds API and derive CS probability per team.
+    Returns {team_abbrev: probability} or {} if API key not set."""
+    import math
+    api_key = st.secrets.get("ODDS_API_KEY", "")
+    if not api_key:
+        return {}
+    try:
+        r = requests.get(
+            "https://api.the-odds-api.com/v4/sports/soccer_epl/odds/",
+            params={"apiKey": api_key, "regions": "uk", "markets": "h2h",
+                    "oddsFormat": "decimal"},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return {}
+        cs: dict[str, float] = {}
+        for game in r.json():
+            home, away = game.get("home_team", ""), game.get("away_team", "")
+            h_o, d_o, a_o = [], [], []
+            for bookie in game.get("bookmakers", []):
+                for mkt in bookie.get("markets", []):
+                    if mkt["key"] != "h2h":
+                        continue
+                    for oc in mkt["outcomes"]:
+                        if oc["name"] == home:       h_o.append(oc["price"])
+                        elif oc["name"] == "Draw":   d_o.append(oc["price"])
+                        elif oc["name"] == away:     a_o.append(oc["price"])
+            if not (h_o and d_o and a_o):
+                continue
+            # Devig implied probabilities
+            oh = 1 / (sum(h_o) / len(h_o))
+            od = 1 / (sum(d_o) / len(d_o))
+            oa = 1 / (sum(a_o) / len(a_o))
+            tot = oh + od + oa
+            p_h, p_a = oh / tot, oa / tot
+            # Expected goals via calibrated EPL formula (home avg ~1.4, away ~1.2)
+            rho = p_h - p_a
+            lam_h = max(0.3, 1.4 + 0.65 * rho)   # home team scores
+            lam_a = max(0.3, 1.2 - 0.65 * rho)   # away team scores
+            # CS probability = opponent scores 0 via Poisson
+            h_abbr = _ODDS_TEAM_MAP.get(home, "")
+            a_abbr = _ODDS_TEAM_MAP.get(away, "")
+            if h_abbr:
+                cs[h_abbr] = round(math.exp(-lam_a), 3)
+            if a_abbr:
+                cs[a_abbr] = round(math.exp(-lam_h), 3)
+        return cs
+    except Exception:
+        return {}
+
+
+def _with_display_cols(df: pd.DataFrame, bookie_cs: dict[str, float]) -> pd.DataFrame:
+    """Add fdr_color and cs_pct columns for display."""
     out = df.copy()
     out["fdr_color"] = out["fdr"].map(lambda x: f"{_FDR_DOT.get(int(x), '⚪')} {int(x)}")
+    if bookie_cs:
+        out["cs_pct"] = out["team"].map(lambda t: f"{bookie_cs.get(t, 0) * 100:.0f}%")
+    else:
+        out["cs_pct"] = out["exp_cs"].map(lambda x: f"{x * 100:.0f}%")
     return out
 
 
@@ -278,18 +353,27 @@ with st.spinner("Loading predictions — first run takes ~3 min..."):
 gw = int(predictions["GW"].iloc[0])
 st.markdown(f"### Gameweek {gw} Predictions")
 
-# Best picks cards
+# League sync + bookie CS (both cached — fast after first load)
+drafted_ids, league_status = get_league_data(SLEEPER_LEAGUE_ID)
+league_ok = bool(drafted_ids)
+bookie_cs  = get_bookie_cs()
+
+# Best picks cards — available (undrafted) players only
+_picks_pool = predictions[~predictions.apply(
+    lambda r: _is_drafted(r["name"], r["display_name"], drafted_ids), axis=1
+)] if league_ok else predictions
+
 bc1, bc2, bc3, bc4 = st.columns(4)
 for col, pos, icon in zip(
     [bc1, bc2, bc3, bc4],
     ["GK", "DEF", "MID", "FWD"],
     ["🧤", "🛡️", "🎯", "⚡"],
 ):
-    pos_df = predictions[predictions["position"] == pos]
+    pos_df = _picks_pool[_picks_pool["position"] == pos]
     if not pos_df.empty:
         top = pos_df.iloc[0]
         with col:
-            st.metric(f"{icon} Top {pos}", f"{top['sleeper_pts']:.1f} pts")
+            st.metric(f"{icon} Top Available {pos}", f"{top['sleeper_pts']:.1f} pts")
             st.caption(top["display_name"])
 
 # Filters row
@@ -303,10 +387,6 @@ with c3:
     min_pts = st.number_input("Min Pts", min_value=0.0, value=0.0, step=1.0)
 with c4:
     search = st.text_input("Search player", placeholder="e.g. Salah, Haaland")
-
-# Sleeper league sync
-drafted_ids, league_status = get_league_data(SLEEPER_LEAGUE_ID)
-league_ok = bool(drafted_ids)
 
 st.caption(league_status)
 
@@ -416,7 +496,7 @@ with st.expander("🔍 Debug", expanded=False):
     st.code("\n".join(name_debug))
 
 st.dataframe(
-    _with_display_cols(view)[_DISPLAY_COLS].head(100),
+    _with_display_cols(view, bookie_cs)[_DISPLAY_COLS].head(100),
     use_container_width=True,
     hide_index=True,
     column_config=_COL_CONFIG,
@@ -431,7 +511,7 @@ tabs = st.tabs(["🧤 GK", "🛡️ DEF", "🎯 MID", "⚡ FWD"])
 for tab, pos in zip(tabs, ["GK", "DEF", "MID", "FWD"]):
     with tab:
         sub = tab_src[tab_src["position"] == pos].head(10)
-        st.dataframe(_with_display_cols(sub)[_DISPLAY_COLS], use_container_width=True,
+        st.dataframe(_with_display_cols(sub, bookie_cs)[_DISPLAY_COLS], use_container_width=True,
                      hide_index=True, column_config=_COL_CONFIG)
 
 # ── My Team ───────────────────────────────────────────────────────────────────
@@ -465,7 +545,7 @@ if username.strip():
                 st.markdown("**Starting 11** *(sorted by predicted pts)*")
                 starters = my_players.head(11)
                 st.dataframe(
-                    _with_display_cols(starters)[_DISPLAY_COLS],
+                    _with_display_cols(starters, bookie_cs)[_DISPLAY_COLS],
                     use_container_width=True,
                     hide_index=True,
                     column_config=_COL_CONFIG,
@@ -477,7 +557,7 @@ if username.strip():
                     st.markdown("**Bench**")
                     bench = my_players.iloc[11:]
                     st.dataframe(
-                        _with_display_cols(bench)[_DISPLAY_COLS],
+                        _with_display_cols(bench, bookie_cs)[_DISPLAY_COLS],
                         use_container_width=True,
                         hide_index=True,
                         column_config=_COL_CONFIG,
@@ -497,7 +577,7 @@ if username.strip():
                         with wtab:
                             top_avail = available[available["position"] == pos].head(5)
                             st.dataframe(
-                                _with_display_cols(top_avail)[_DISPLAY_COLS],
+                                _with_display_cols(top_avail, bookie_cs)[_DISPLAY_COLS],
                                 use_container_width=True,
                                 hide_index=True,
                                 column_config=_COL_CONFIG,
