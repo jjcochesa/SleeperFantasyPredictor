@@ -285,10 +285,12 @@ for col, pos, icon in zip(
     ["GK", "DEF", "MID", "FWD"],
     ["🧤", "🛡️", "🎯", "⚡"],
 ):
-    top = predictions[predictions["position"] == pos].iloc[0]
-    with col:
-        st.metric(f"{icon} Top {pos}", f"{top['sleeper_pts']:.1f} pts")
-        st.caption(top["display_name"])
+    pos_df = predictions[predictions["position"] == pos]
+    if not pos_df.empty:
+        top = pos_df.iloc[0]
+        with col:
+            st.metric(f"{icon} Top {pos}", f"{top['sleeper_pts']:.1f} pts")
+            st.caption(top["display_name"])
 
 # Filters row
 c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
