@@ -406,9 +406,10 @@ if team_filter != "All":
 if min_pts > 0:
     view = view[view["sleeper_pts"] >= min_pts]
 if search:
+    _sq = _normalise(search)
     mask = (
-        view["name"].str.lower().str.contains(search.lower(), na=False)
-        | view["display_name"].str.lower().str.contains(search.lower(), na=False)
+        view["name"].map(_normalise).str.contains(_sq, na=False)
+        | view["display_name"].map(_normalise).str.contains(_sq, na=False)
     )
     view = view[mask]
 if available_only and league_ok:
