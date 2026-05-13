@@ -517,7 +517,7 @@ def build_team_gw_stats(df: pd.DataFrame,
         ts = att_stats.merge(def_stats, on=["team", "GW"], how="left")
 
     ts = ts.sort_values(["team", "GW"])
-    for w in [3, 5]:
+    for w in [3, 4, 5]:
         for col in ["team_goals_conceded", "team_xg_conceded", "team_goals_scored", "team_xg_scored"]:
             if col in ts.columns:
                 ts[f"{col}_avg{w}"] = ts.groupby("team")[col].transform(
@@ -542,12 +542,14 @@ def enrich_with_fixture_context(df: pd.DataFrame, ts: pd.DataFrame,
                      {"team": a, "GW": gw, "opp": h, "was_home": 0}]
     fdf = pd.DataFrame(fix_rows)
     opp_cols = ["team", "GW", "team_goals_conceded_avg5", "team_xg_conceded_avg5",
-                "team_goals_scored_avg5", "team_xg_scored_avg5"]
+                "team_goals_scored_avg5", "team_xg_scored_avg5",
+                "team_goals_conceded_avg4"]
     odf = ts[[c for c in opp_cols if c in ts.columns]].rename(
         columns={"team": "opp", "team_goals_conceded_avg5": "opp_gc_avg5",
                  "team_xg_conceded_avg5": "opp_xgc_avg5",
                  "team_goals_scored_avg5": "opp_gs_avg5",
-                 "team_xg_scored_avg5": "opp_xgs_avg5"})
+                 "team_xg_scored_avg5": "opp_xgs_avg5",
+                 "team_goals_conceded_avg4": "opp_gc_avg4"})
     fdf = fdf.merge(odf, on=["opp", "GW"], how="left")
     fdf = fdf.merge(str_df, on="opp", how="left")
     fdf["opp_att_str"] = fdf.apply(lambda r: r["strength_attack_away"] if r["was_home"] == 1
@@ -556,8 +558,9 @@ def enrich_with_fixture_context(df: pd.DataFrame, ts: pd.DataFrame,
                                    else r["strength_defence_home"], axis=1)
     fdf = fdf.drop(columns=["opp", "strength_attack_home", "strength_attack_away",
                              "strength_defence_home", "strength_defence_away"])
-    for c in ["opp_gc_avg5", "opp_xgc_avg5", "opp_gs_avg5", "opp_xgs_avg5"]:
-        fdf[c] = fdf[c].fillna(1.2)
+    for c in ["opp_gc_avg5", "opp_gc_avg4", "opp_xgc_avg5", "opp_gs_avg5", "opp_xgs_avg5"]:
+        if c in fdf.columns:
+            fdf[c] = fdf[c].fillna(1.2)
     fdf[["opp_att_str", "opp_def_str"]] = fdf[["opp_att_str", "opp_def_str"]].fillna(1000)
     df = df.drop(columns=["was_home"], errors="ignore")
     return df.merge(fdf, on=["team", "GW"], how="left")
@@ -673,6 +676,7 @@ def predict_next_gw(df: pd.DataFrame,
         base.at[idx, "fdr"]          = fi.get("fdr", 3)
         base.at[idx, "was_home"]     = ih
         base.at[idx, "opp_gc_avg5"]  = os.get("team_goals_conceded_avg5", 1.2)
+        base.at[idx, "opp_gc_avg4"]  = os.get("team_goals_conceded_avg4", 1.2)
         base.at[idx, "opp_xgc_avg5"] = os.get("team_xg_conceded_avg5", 1.2)
         base.at[idx, "opp_gs_avg5"]  = os.get("team_goals_scored_avg5", 1.2)
         base.at[idx, "opp_xgs_avg5"] = os.get("team_xg_scored_avg5", 1.2)
@@ -771,7 +775,10 @@ def predict_next_gw(df: pd.DataFrame,
         # ── Fixture adjustments ───────────────────────────────────────────────
         fdr    = int(row.get("fdr", 3))
         opp_gs = max(0.3, float(row.get("opp_gs_avg5", 1.3)))
-        opp_gc = max(0.3, float(row.get("opp_gc_avg5", 1.3)))
+        # Blend last-4 (60%) with last-5 (40%) to capture teams in defensive freefall faster
+        opp_gc5 = float(row.get("opp_gc_avg5", 1.3))
+        opp_gc4 = float(row.get("opp_gc_avg4", opp_gc5))
+        opp_gc  = max(0.3, 0.6 * opp_gc4 + 0.4 * opp_gc5)
 
         fdr_att        = {1: 1.6, 2: 1.3, 3: 1.0, 4: 0.72, 5: 0.48}[fdr]
         opp_def_factor = min(1.6, max(0.5, opp_gc / 1.3))
