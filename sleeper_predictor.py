@@ -780,10 +780,10 @@ def predict_next_gw(df: pd.DataFrame,
         opp_gc4 = float(row.get("opp_gc_avg4", opp_gc5))
         opp_gc  = max(0.3, 0.6 * opp_gc4 + 0.4 * opp_gc5)
 
-        fdr_att        = {1: 1.6, 2: 1.3, 3: 1.0, 4: 0.72, 5: 0.48}[fdr]
+        fdr_att        = {1: 1.35, 2: 1.15, 3: 1.0, 4: 0.82, 5: 0.68}[fdr]
         opp_def_factor = min(1.6, max(0.5, opp_gc / 1.3))
         att_mult       = min(2.0, fdr_att * opp_def_factor)  # cap: best fixture × worst def = 2×
-        fdr_def        = {1: 0.65, 2: 0.82, 3: 1.0, 4: 1.25, 5: 1.55}[fdr]
+        fdr_def        = {1: 0.72, 2: 0.88, 3: 1.0, 4: 1.18, 5: 1.38}[fdr]
         is_home        = int(row.get("was_home", 1))
         ha_mult        = 1.08 if is_home else 0.93
 
